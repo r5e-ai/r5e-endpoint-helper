@@ -1,4 +1,4 @@
-//! Zero-dependency HTTP/1.1 client for `r5e-endpoint-helper` Badge enrolment against `recurse_gateway`:
+//! HTTP/1.1 (`http://` and `https://` via `rustls`) client for `r5e-endpoint-helper` Badge enrolment against `recurse_gateway`:
 //! - `POST /v1/authority/badges/prepare`
 //! - `POST /v1/authority/badges/finalize`
 //!
@@ -11,12 +11,11 @@ use crate::attestation::{
     FinalizeBadgeRequest, FinalizedBadgeResponse, PrepareBadgeRequest, PreparedBadgeResponse,
     SubjectPublicKey,
 };
+use crate::http_transport::send_http11_request;
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine;
 use ed25519_dalek::SigningKey;
 use serde_json::Value;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
 use std::time::Duration;
 
 pub const PREPARE_BADGE_PATH: &str = "/v1/authority/badges/prepare";
@@ -228,137 +227,18 @@ fn classify_error_status(status: u16, body_bytes: &[u8]) -> GatewayEnrolmentErro
     }
 }
 
-fn parse_http_base_url(raw: &str) -> Result<(String, String), GatewayEnrolmentError> {
-    let rest = raw.strip_prefix("http://").ok_or_else(|| {
-        GatewayEnrolmentError::Transport(format!("expected http:// gateway URL, got {raw}"))
-    })?;
-    let (host_port, base_path) = match rest.find('/') {
-        Some(idx) => (&rest[..idx], rest[idx..].trim_end_matches('/')),
-        None => (rest, ""),
-    };
-    let connect_addr = if host_port.contains(':') {
-        host_port.to_string()
-    } else {
-        format!("{host_port}:80")
-    };
-    Ok((connect_addr, base_path.to_string()))
-}
-
 fn post_json_http11(
     cfg: &EnrolmentClientConfig,
     path: &str,
     json_body: &[u8],
 ) -> Result<(u16, Vec<u8>), GatewayEnrolmentError> {
-    let (connect_addr, base_path) = parse_http_base_url(&cfg.gateway_base_url)?;
-    let full_path = format!("{base_path}{path}");
-
-    let mut stream = TcpStream::connect(&connect_addr)
-        .map_err(|e| GatewayEnrolmentError::Transport(format!("connect {connect_addr}: {e}")))?;
-    let _ = stream.set_read_timeout(Some(cfg.timeout));
-    let _ = stream.set_write_timeout(Some(cfg.timeout));
-
-    let mut req_head = format!(
-        "POST {full_path} HTTP/1.1\r\nHost: {connect_addr}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n",
-        json_body.len()
-    );
-    if let Some(ref bearer) = cfg.bearer_token {
-        req_head.push_str(&format!("Authorization: Bearer {bearer}\r\n"));
-    }
-    req_head.push_str("\r\n");
-
-    stream
-        .write_all(req_head.as_bytes())
-        .and_then(|_| stream.write_all(json_body))
-        .and_then(|_| stream.flush())
-        .map_err(|e| GatewayEnrolmentError::Transport(format!("write request: {e}")))?;
-
-    let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    reader
-        .read_line(&mut status_line)
-        .map_err(|e| GatewayEnrolmentError::Transport(format!("read status line: {e}")))?;
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| {
-            GatewayEnrolmentError::Transport(format!("malformed HTTP status line: {status_line:?}"))
-        })?
-        .parse()
-        .map_err(|e| GatewayEnrolmentError::Transport(format!("invalid HTTP status: {e}")))?;
-
-    let mut content_length: Option<usize> = None;
-    let mut is_chunked = false;
-    loop {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|e| GatewayEnrolmentError::Transport(format!("read header: {e}")))?;
-        let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some((name, val)) = trimmed.split_once(':') {
-            let name_lc = name.trim().to_ascii_lowercase();
-            let val_trim = val.trim();
-            if name_lc == "content-length" {
-                content_length = val_trim.parse::<usize>().ok();
-            } else if name_lc == "transfer-encoding"
-                && val_trim.to_ascii_lowercase().contains("chunked")
-            {
-                is_chunked = true;
-            }
-        }
-    }
-
-    let body = if is_chunked {
-        read_chunked_body(&mut reader)?
-    } else if let Some(len) = content_length {
-        let mut buf = vec![0u8; len];
-        reader
-            .read_exact(&mut buf)
-            .map_err(|e| GatewayEnrolmentError::Transport(format!("read body ({len}B): {e}")))?;
-        buf
-    } else {
-        let mut buf = Vec::new();
-        reader
-            .read_to_end(&mut buf)
-            .map_err(|e| GatewayEnrolmentError::Transport(format!("read body EOF: {e}")))?;
-        buf
-    };
-
-    Ok((status, body))
-}
-
-fn read_chunked_body<R: BufRead>(reader: &mut R) -> Result<Vec<u8>, GatewayEnrolmentError> {
-    let mut out = Vec::new();
-    loop {
-        let mut size_line = String::new();
-        reader
-            .read_line(&mut size_line)
-            .map_err(|e| GatewayEnrolmentError::Transport(format!("read chunk size: {e}")))?;
-        let hex_part = size_line
-            .trim()
-            .split(';')
-            .next()
-            .unwrap_or_default()
-            .trim();
-        let chunk_len = usize::from_str_radix(hex_part, 16).map_err(|e| {
-            GatewayEnrolmentError::Transport(format!("invalid chunk size {hex_part:?}: {e}"))
-        })?;
-        if chunk_len == 0 {
-            let mut crlf = String::new();
-            let _ = reader.read_line(&mut crlf);
-            break;
-        }
-        let mut chunk = vec![0u8; chunk_len];
-        reader
-            .read_exact(&mut chunk)
-            .map_err(|e| GatewayEnrolmentError::Transport(format!("read chunk data: {e}")))?;
-        out.extend_from_slice(&chunk);
-        let mut crlf = [0u8; 2];
-        reader
-            .read_exact(&mut crlf)
-            .map_err(|e| GatewayEnrolmentError::Transport(format!("read chunk CRLF: {e}")))?;
-    }
-    Ok(out)
+    send_http11_request(
+        &cfg.gateway_base_url,
+        cfg.timeout,
+        "POST",
+        path,
+        cfg.bearer_token.as_deref(),
+        Some(json_body),
+    )
+    .map_err(GatewayEnrolmentError::Transport)
 }

@@ -5,6 +5,7 @@ pub mod disclosure;
 pub mod enrolment_http;
 pub mod evidence_http;
 pub mod hold_release;
+pub mod http_transport;
 pub mod mcp_stdio;
 pub mod off_path_observer;
 pub mod offline_badge;
