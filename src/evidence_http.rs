@@ -1,4 +1,4 @@
-//! Zero-dependency HTTP/1.1 client, auto-chunking batch shipper, `0600` enrolled state persistence,
+//! HTTP/1.1 (`http://` and `https://` via `rustls`) client, auto-chunking batch shipper, `0600` enrolled state persistence,
 //! and workload record builder for `A8` Workload Record Admission & Session Opening:
 //! - `POST /v1/evidence/sessions` (`open_session_over_http`)
 //! - `POST /v1/evidence/records` (`ship_records_over_http`, `ship_records_batches_over_http`,
@@ -21,9 +21,9 @@ use crate::attestation::{
     SignedEndpointRecord,
 };
 use crate::claim_http::{
-    is_valid_bytes_ref, is_valid_evidence_ref, is_valid_uri_identity, parse_http_base_url,
-    read_chunked_body, ClaimError, SubmitGrantsRequest,
+    is_valid_bytes_ref, is_valid_evidence_ref, is_valid_uri_identity, SubmitGrantsRequest,
 };
+use crate::http_transport::send_http11_request;
 use crate::mcp_stdio::DescriptorObservation;
 use crate::outbox_cipher::{
     decrypt_outbox_parts, encrypt_outbox_parts, EncryptedOutboxQueueFile, OutboxKey,
@@ -38,8 +38,6 @@ use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::fs;
-use std::io::{BufRead, BufReader, Read, Write};
-use std::net::TcpStream;
 use std::path::Path;
 use std::time::Duration;
 
@@ -2076,13 +2074,6 @@ pub fn persist_outbox_and_ship_state_with_key(
     }
 }
 
-fn map_claim_transport_err(err: ClaimError) -> EvidenceHttpError {
-    match err {
-        ClaimError::Transport(msg) => EvidenceHttpError::Transport(msg),
-        other => EvidenceHttpError::Transport(other.to_string()),
-    }
-}
-
 fn post_json_bearer_http11(
     cfg: &EvidenceClientConfig,
     path: &str,
@@ -2098,80 +2089,13 @@ fn post_json_bearer_http11(
             "bearer token contains illegal CR/LF characters".to_string(),
         ));
     }
-    let (connect_addr, host_header, base_path) =
-        parse_http_base_url(&cfg.gateway_base_url).map_err(map_claim_transport_err)?;
-    let full_path = format!("{base_path}{path}");
-
-    let mut stream = TcpStream::connect(&connect_addr)
-        .map_err(|e| EvidenceHttpError::Transport(format!("connect {connect_addr}: {e}")))?;
-    let _ = stream.set_read_timeout(Some(cfg.timeout));
-    let _ = stream.set_write_timeout(Some(cfg.timeout));
-
-    let req_head = format!(
-        "POST {full_path} HTTP/1.1\r\nHost: {host_header}\r\nAuthorization: Bearer {}\r\nContent-Type: application/json\r\nAccept: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        cfg.bearer_token,
-        json_body.len()
-    );
-
-    stream
-        .write_all(req_head.as_bytes())
-        .and_then(|_| stream.write_all(json_body))
-        .and_then(|_| stream.flush())
-        .map_err(|e| EvidenceHttpError::Transport(format!("write POST {full_path}: {e}")))?;
-
-    let mut reader = BufReader::new(stream);
-    let mut status_line = String::new();
-    reader
-        .read_line(&mut status_line)
-        .map_err(|e| EvidenceHttpError::Transport(format!("read status line: {e}")))?;
-    let status: u16 = status_line
-        .split_whitespace()
-        .nth(1)
-        .ok_or_else(|| {
-            EvidenceHttpError::Transport(format!("malformed HTTP status line: {status_line:?}"))
-        })?
-        .parse()
-        .map_err(|e| EvidenceHttpError::Transport(format!("invalid HTTP status: {e}")))?;
-
-    let mut content_length: Option<usize> = None;
-    let mut is_chunked = false;
-    loop {
-        let mut line = String::new();
-        reader
-            .read_line(&mut line)
-            .map_err(|e| EvidenceHttpError::Transport(format!("read header: {e}")))?;
-        let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
-        if trimmed.is_empty() {
-            break;
-        }
-        if let Some((name, val)) = trimmed.split_once(':') {
-            let name_lc = name.trim().to_ascii_lowercase();
-            let val_trim = val.trim();
-            if name_lc == "content-length" {
-                content_length = val_trim.parse::<usize>().ok();
-            } else if name_lc == "transfer-encoding"
-                && val_trim.to_ascii_lowercase().contains("chunked")
-            {
-                is_chunked = true;
-            }
-        }
-    }
-
-    let body = if is_chunked {
-        read_chunked_body(&mut reader).map_err(map_claim_transport_err)?
-    } else if let Some(len) = content_length {
-        let mut buf = vec![0u8; len];
-        reader
-            .read_exact(&mut buf)
-            .map_err(|e| EvidenceHttpError::Transport(format!("read body ({len}B): {e}")))?;
-        buf
-    } else {
-        let mut buf = Vec::new();
-        reader
-            .read_to_end(&mut buf)
-            .map_err(|e| EvidenceHttpError::Transport(format!("read body EOF: {e}")))?;
-        buf
-    };
-
-    Ok((status, body))
+    send_http11_request(
+        &cfg.gateway_base_url,
+        cfg.timeout,
+        "POST",
+        path,
+        Some(&cfg.bearer_token),
+        Some(json_body),
+    )
+    .map_err(EvidenceHttpError::Transport)
 }
