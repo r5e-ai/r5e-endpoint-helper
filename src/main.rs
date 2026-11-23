@@ -117,6 +117,38 @@ impl From<CliAuthorizationMode> for RootChangeAuthorization {
     }
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum CliHookClient {
+    Antigravity,
+    ClaudeCode,
+    Codex,
+}
+
+impl From<CliHookClient> for r5e_endpoint_helper::agent_hooks::HookClient {
+    fn from(value: CliHookClient) -> Self {
+        match value {
+            CliHookClient::Antigravity => Self::Antigravity,
+            CliHookClient::ClaudeCode => Self::ClaudeCode,
+            CliHookClient::Codex => Self::Codex,
+        }
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum CliHookMode {
+    Observe,
+    Enforce,
+}
+
+impl From<CliHookMode> for r5e_endpoint_helper::agent_hooks::HookMode {
+    fn from(value: CliHookMode) -> Self {
+        match value {
+            CliHookMode::Observe => Self::Observe,
+            CliHookMode::Enforce => Self::Enforce,
+        }
+    }
+}
+
 #[derive(Subcommand)]
 enum Commands {
     /// Print the offline, zero-login privacy and collection disclosure for this laptop.
@@ -1057,6 +1089,78 @@ enum Commands {
         /// Optional `0600` 32-byte symmetric key file for authenticated at-rest outbox decryption (`ChaCha20-Poly1305`; falls back to `R5E_OUTBOX_KEY_FILE`).
         #[arg(long)]
         outbox_key_file: Option<PathBuf>,
+    },
+    /// Native Rust agent lifecycle hook handler (`antigravity`, `claude-code`, or `codex`).
+    /// Reads hook JSON on stdin, redacts secrets, optionally evaluates Cedar in `enforce` mode,
+    /// enqueues locally (`0600`), and spawns a detached background drainer (`File::try_lock`) so
+    /// stdin -> stdout completes in <20 ms.
+    Hook {
+        /// Agent client format (`antigravity`, `claude-code`, or `codex`).
+        #[arg(value_enum)]
+        client: CliHookClient,
+        /// Hook mode (`observe` is strictly fail-open; `enforce` gates `PreToolUse` via Cedar).
+        #[arg(long, value_enum, default_value_t = CliHookMode::Observe)]
+        mode: CliHookMode,
+        /// Gateway base URL (`https://...` or `http://127.0.0.1:4000`; falls back to `R5E_GATEWAY_URL`).
+        #[arg(long = "gateway", visible_alias = "gateway-url")]
+        gateway: Option<String>,
+        /// Directory holding `0700`/`0600` per-conversation hook queues, enrolled states, and logs.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Environment variable holding the gateway bearer token (never pass raw tokens on CLI argv).
+        #[arg(
+            long = "bearer-token-env",
+            visible_alias = "token-env",
+            default_value = "R5E_TOKEN"
+        )]
+        bearer_token_env: String,
+        /// Optional file (`0600` recommended) containing the gateway bearer token.
+        #[arg(long = "bearer-token-file", visible_alias = "token-file")]
+        bearer_token_file: Option<PathBuf>,
+        /// Optional local Cedar policy bundle file (used in `enforce` mode and badge enrolment).
+        #[arg(long = "cedar-policy", visible_alias = "policy-file")]
+        cedar_policy: Option<PathBuf>,
+        /// Internal detached background drainer target conversation ID.
+        #[arg(long, hide = true)]
+        drain: Option<String>,
+    },
+    /// Write or merge native `r5e-endpoint-helper hook` configuration for `antigravity`,
+    /// `claude-code`, or `codex` without clobbering existing user hooks.
+    InstallHooks {
+        /// Agent client to configure (`antigravity`, `claude-code`, or `codex`).
+        #[arg(value_enum)]
+        client: CliHookClient,
+        /// Gateway base URL (`https://...` or `http://127.0.0.1:4000`).
+        #[arg(
+            long = "gateway",
+            visible_alias = "gateway-url",
+            default_value = "http://127.0.0.1:4000"
+        )]
+        gateway: String,
+        /// Hook mode (`observe` or `enforce`).
+        #[arg(long, value_enum, default_value_t = CliHookMode::Observe)]
+        mode: CliHookMode,
+        /// Target configuration directory (e.g. `.agents` for Antigravity, `~/.claude` for Claude Code).
+        #[arg(long)]
+        path: PathBuf,
+        /// Optional hook state directory passed through to `hook --state-dir`.
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Optional local Cedar policy file passed through to `hook --cedar-policy`.
+        #[arg(long = "cedar-policy", visible_alias = "policy-file")]
+        cedar_policy: Option<PathBuf>,
+        /// Optional bearer token file passed through to `hook --bearer-token-file`.
+        #[arg(long = "bearer-token-file", visible_alias = "token-file")]
+        bearer_token_file: Option<PathBuf>,
+    },
+    /// Print a machine-readable endpoint hook/enrollment status snapshot for desktop/tray IPC.
+    Status {
+        /// Hook state directory to inspect (defaults to `R5E_HOOK_STATE_DIR` or `~/.config/r5e/hooks`).
+        #[arg(long)]
+        state_dir: Option<PathBuf>,
+        /// Emit canonical machine-readable JSON (`version`, `gateway_url`, `enrolled`, `badge_ref`, `active_sessions`, `queued_events`, `last_ship_at`, `last_error`).
+        #[arg(long, default_value_t = false)]
+        json: bool,
     },
     /// Generate a fresh `0600` 32-byte OS-random symmetric key file for authenticated at-rest
     /// outbox encryption (`--outbox-key-file` / `R5E_OUTBOX_KEY_FILE`).
@@ -4920,6 +5024,118 @@ permit(
                 encode_canonical_json(&summary).expect("canonical flush-outbox response JSON");
             println!("{}", String::from_utf8_lossy(&out_bytes));
         }
+        Commands::Hook {
+            client,
+            mode,
+            gateway,
+            state_dir,
+            bearer_token_env,
+            bearer_token_file,
+            cedar_policy,
+            drain,
+        } => {
+            use r5e_endpoint_helper::agent_hooks::{
+                default_hook_state_dir, drain_conversation, run_hook_invocation, HookClient,
+                HookMode, HookRunOptions,
+            };
+            let resolved_gateway = gateway
+                .or_else(|| std::env::var("R5E_GATEWAY_URL").ok())
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or_else(|| "http://127.0.0.1:4000".to_string());
+            let opts = HookRunOptions {
+                client: HookClient::from(client),
+                mode: HookMode::from(mode),
+                gateway_url: resolved_gateway,
+                state_dir: state_dir.unwrap_or_else(default_hook_state_dir),
+                bearer_token_env,
+                bearer_token_file,
+                cedar_policy,
+                spawn_drainer: true,
+            };
+            if let Some(conv_id) = drain {
+                let _ = drain_conversation(&conv_id, &opts);
+                exit(0);
+            }
+            let mut stdin_buf = String::new();
+            let _ = io::stdin().read_to_string(&mut stdin_buf);
+            let out_json = run_hook_invocation(&stdin_buf, &opts);
+            println!(
+                "{}",
+                serde_json::to_string(&out_json).unwrap_or_else(|_| "{}".to_string())
+            );
+        }
+        Commands::InstallHooks {
+            client,
+            gateway,
+            mode,
+            path,
+            state_dir,
+            cedar_policy,
+            bearer_token_file,
+        } => {
+            use r5e_endpoint_helper::agent_hooks::{
+                install_hooks_config, HookClient, HookMode, InstallHooksOptions,
+            };
+            let helper_bin =
+                std::env::current_exe().unwrap_or_else(|_| PathBuf::from("r5e-endpoint-helper"));
+            let opts = InstallHooksOptions {
+                client: HookClient::from(client),
+                mode: HookMode::from(mode),
+                gateway_url: gateway,
+                target_dir: path,
+                helper_bin,
+                state_dir,
+                cedar_policy,
+                bearer_token_file,
+            };
+            match install_hooks_config(&opts) {
+                Ok(config_path) => {
+                    let summary = json!({
+                        "ok": true,
+                        "client": opts.client.as_str(),
+                        "mode": opts.mode.as_str(),
+                        "gateway_url": opts.gateway_url,
+                        "config_path": config_path.to_string_lossy(),
+                        "notice": "Secret redaction is best-effort; tool arguments and outputs are shipped as erasable content blobs to the configured gateway.",
+                    });
+                    let out_bytes = encode_canonical_json(&summary)
+                        .expect("canonical install-hooks response JSON");
+                    println!("{}", String::from_utf8_lossy(&out_bytes));
+                }
+                Err(err) => {
+                    eprintln!("r5e-endpoint-helper: install-hooks failed: {err}");
+                    exit(1);
+                }
+            }
+        }
+        Commands::Status {
+            state_dir,
+            json: as_json,
+        } => {
+            use r5e_endpoint_helper::agent_hooks::{
+                collect_status_snapshot, default_hook_state_dir, encode_status_json,
+            };
+            let dir = state_dir.unwrap_or_else(default_hook_state_dir);
+            let snapshot = collect_status_snapshot(&dir);
+            if as_json {
+                match encode_status_json(&snapshot) {
+                    Ok(s) => println!("{s}"),
+                    Err(err) => {
+                        eprintln!("r5e-endpoint-helper: status failed: {err}");
+                        exit(1);
+                    }
+                }
+            } else {
+                println!(
+                    "r5e-endpoint-helper v{} | enrolled={} | active_sessions={} | queued_events={} | gateway={}",
+                    snapshot.version,
+                    snapshot.enrolled,
+                    snapshot.active_sessions,
+                    snapshot.queued_events,
+                    snapshot.gateway_url.as_deref().unwrap_or("(none)")
+                );
+            }
+        }
         Commands::GenerateOutboxKey { out, force } => {
             if let Err(err) = OutboxKey::generate_to_file_0600(&out, force) {
                 eprintln!("r5e-endpoint-helper: {err}");
@@ -5612,6 +5828,12 @@ fn run_exec_subcommand(
         }
     };
 
+    let target_basename = std::path::Path::new(&program)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(&program);
+
     let t_decision = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
     let pd_rec = match st.append_policy_decision_record(
         stream_suffix,
@@ -5623,7 +5845,7 @@ fn run_exec_subcommand(
         &verdict,
         posture,
         "ExecCommand",
-        &program,
+        target_basename,
     ) {
         Ok(rec) => rec,
         Err(err) => {

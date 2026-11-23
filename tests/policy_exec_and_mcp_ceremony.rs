@@ -1023,7 +1023,7 @@ forbid(
         );
         assert_eq!(
             st.admitted_records[0].payload["body"]["details"]["target"],
-            "/bin/echo"
+            "echo"
         );
         assert_eq!(
             st.admitted_records[0].payload["body"]["details"]["matchingPolicyIds"],
@@ -1069,7 +1069,7 @@ forbid(
         );
         assert_eq!(
             st.admitted_records[3].payload["body"]["details"]["target"],
-            "/bin/sh"
+            "sh"
         );
         assert_eq!(
             st.admitted_records[3].payload["body"]["details"]["matchingPolicyIds"],

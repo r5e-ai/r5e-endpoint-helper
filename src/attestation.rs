@@ -345,7 +345,8 @@ pub fn parse_ed25519_signing_key_bytes(
 
     if trimmed.len() == 64 && trimmed.bytes().all(|b| b.is_ascii_hexdigit()) {
         let mut seed = [0u8; 32];
-        for (i, chunk) in trimmed.as_bytes().chunks_exact(2).enumerate() {
+        let (chunks, _) = trimmed.as_bytes().as_chunks::<2>();
+        for (i, chunk) in chunks.iter().enumerate() {
             let s = std::str::from_utf8(chunk).unwrap_or_default();
             seed[i] = u8::from_str_radix(s, 16)
                 .map_err(|_| format!("invalid hex seed in {source_label}"))?;

@@ -2555,114 +2555,117 @@ fn full_es256_publisher_and_es256_root_detached_piv_ceremony_verifies_end_to_end
         all_blobs.insert(b.blob_ref.clone(), b);
     }
 
-    let verify_exported_chain_bundle =
-        |label: &str, recs: Vec<r5e_endpoint_helper::attestation::SignedEndpointRecord>| {
-            let mut stream_heads = BTreeMap::<String, (u64, String)>::new();
-            let mut profile_refs = std::collections::BTreeSet::<String>::new();
-            for rec in &recs {
-                let opened: Value =
-                    serde_json::from_slice(&decode_strict_base64(&rec.envelope.payload).unwrap())
-                        .unwrap();
-                let prof_ref = opened["profileRef"].as_str().unwrap().to_string();
-                profile_refs.insert(prof_ref);
-                if opened["kind"].as_str() == Some("DefinitionPublished") {
-                    continue;
-                }
-                let s = opened["stream"].as_str().unwrap().to_string();
-                let sq = opened["seq"].as_u64().unwrap();
-                match stream_heads.get(&s) {
-                    Some((prev_sq, _)) if *prev_sq >= sq => {}
-                    _ => {
-                        stream_heads.insert(s, (sq, rec.record_ref.clone()));
-                    }
+    let verify_exported_chain_bundle = |label: &str,
+                                        recs: Vec<
+        r5e_endpoint_helper::attestation::SignedEndpointRecord,
+    >| {
+        let mut stream_heads = BTreeMap::<String, (u64, String)>::new();
+        let mut profile_refs = std::collections::BTreeSet::<String>::new();
+        for rec in &recs {
+            let opened: Value =
+                serde_json::from_slice(&decode_strict_base64(&rec.envelope.payload).unwrap())
+                    .unwrap();
+            let prof_ref = opened["profileRef"].as_str().unwrap().to_string();
+            profile_refs.insert(prof_ref);
+            if opened["kind"].as_str() == Some("DefinitionPublished") {
+                continue;
+            }
+            let s = opened["stream"].as_str().unwrap().to_string();
+            let sq = opened["seq"].as_u64().unwrap();
+            match stream_heads.get(&s) {
+                Some((prev_sq, _)) if *prev_sq >= sq => {}
+                _ => {
+                    stream_heads.insert(s, (sq, rec.record_ref.clone()));
                 }
             }
-            let scope_at: Vec<Value> = stream_heads
+        }
+        let scope_at: Vec<Value> = stream_heads
             .into_iter()
             .map(|(stream, (seq, event))| json!({ "stream": stream, "seq": seq, "event": event }))
             .collect();
 
-            let export_bundle = json!({
-                "format": "r5e.provenance-export/v2",
-                "scope": {
-                    "query": { "chain": &chain_ref },
-                    "at": scope_at,
-                },
-                "records": recs,
-                "keys": all_keys.values().cloned().collect::<Vec<_>>(),
-                "blobs": all_blobs.values().cloned().collect::<Vec<_>>(),
-                "seals": [],
-                "checkpoints": [],
-                "proofs": [],
-                "publicationProofs": [],
-                "omissions": [],
-            });
-            let bundle_path = tmp.join(format!("{label}.json"));
-            fs::write(&bundle_path, encode_canonical_json(&export_bundle).unwrap()).unwrap();
+        let export_bundle = json!({
+            "format": "r5e.provenance-export/v2",
+            "scope": {
+                "query": { "chain": &chain_ref },
+                "at": scope_at,
+            },
+            "records": recs,
+            "keys": all_keys.values().cloned().collect::<Vec<_>>(),
+            "blobs": all_blobs.values().cloned().collect::<Vec<_>>(),
+            "seals": [],
+            "checkpoints": [],
+            "proofs": [],
+            "publicationProofs": [],
+            "omissions": [],
+        });
+        let bundle_path = tmp.join(format!("{label}.json"));
+        fs::write(&bundle_path, encode_canonical_json(&export_bundle).unwrap()).unwrap();
 
-            if let Some((py_dir, py_bin)) = resolve_py_verifier() {
-                let mut cmd = Command::new(&py_bin);
-                cmd.current_dir(&py_dir)
-                    .env("PYTHONPATH", &py_dir)
-                    .arg("-m")
-                    .arg("r5e_verify")
-                    .arg(&bundle_path)
-                    .arg("--trusted-chain")
-                    .arg(&chain_ref)
-                    .arg("--trusted-publisher")
-                    .arg(&pub_pin);
-                for pref in &profile_refs {
-                    cmd.arg("--trusted-profile").arg(pref);
-                }
-                let out = cmd
-                    .output()
-                    .expect("run Python verifier on es256 PIV bundle");
-                let stdout_txt = String::from_utf8_lossy(&out.stdout);
-                let stderr_txt = String::from_utf8_lossy(&out.stderr);
-                assert!(
-                    out.status.success(),
-                    "r5e_verify ({label}) failed ({:?}):\nstdout: {stdout_txt}\nstderr: {stderr_txt}",
-                    out.status.code()
-                );
-                let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-                assert_eq!(report["summary"]["failed"], 0, "r5e_verify report: {report}");
-                assert_eq!(
-                    report["summary"]["incomplete"], 0,
-                    "r5e_verify report had incomplete findings: {report}"
-                );
+        if let Some((py_dir, py_bin)) = resolve_py_verifier() {
+            let mut cmd = Command::new(&py_bin);
+            cmd.current_dir(&py_dir)
+                .env("PYTHONPATH", &py_dir)
+                .arg("-m")
+                .arg("r5e_verify")
+                .arg(&bundle_path)
+                .arg("--trusted-chain")
+                .arg(&chain_ref)
+                .arg("--trusted-publisher")
+                .arg(&pub_pin);
+            for pref in &profile_refs {
+                cmd.arg("--trusted-profile").arg(pref);
             }
+            let out = cmd
+                .output()
+                .expect("run Python verifier on es256 PIV bundle");
+            let stdout_txt = String::from_utf8_lossy(&out.stdout);
+            let stderr_txt = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                out.status.success(),
+                "r5e_verify ({label}) failed ({:?}):\nstdout: {stdout_txt}\nstderr: {stderr_txt}",
+                out.status.code()
+            );
+            let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(
+                report["summary"]["failed"], 0,
+                "r5e_verify report: {report}"
+            );
+            assert_eq!(
+                report["summary"]["incomplete"], 0,
+                "r5e_verify report had incomplete findings: {report}"
+            );
+        }
 
-            if let Some(rs_bin) = resolve_rs_verifier_bin() {
-                let mut cmd = Command::new(&rs_bin);
-                cmd.arg(&bundle_path)
-                    .arg("--trusted-chain")
-                    .arg(&chain_ref)
-                    .arg("--trusted-publisher")
-                    .arg(&pub_pin);
-                for pref in &profile_refs {
-                    cmd.arg("--trusted-profile").arg(pref);
-                }
-                let out = cmd
-                    .output()
-                    .expect("run Rust verifier on es256 PIV bundle");
-                let stdout_txt = String::from_utf8_lossy(&out.stdout);
-                let stderr_txt = String::from_utf8_lossy(&out.stderr);
-                assert!(
+        if let Some(rs_bin) = resolve_rs_verifier_bin() {
+            let mut cmd = Command::new(&rs_bin);
+            cmd.arg(&bundle_path)
+                .arg("--trusted-chain")
+                .arg(&chain_ref)
+                .arg("--trusted-publisher")
+                .arg(&pub_pin);
+            for pref in &profile_refs {
+                cmd.arg("--trusted-profile").arg(pref);
+            }
+            let out = cmd.output().expect("run Rust verifier on es256 PIV bundle");
+            let stdout_txt = String::from_utf8_lossy(&out.stdout);
+            let stderr_txt = String::from_utf8_lossy(&out.stderr);
+            assert!(
                     out.status.success(),
                     "recurse_verify ({label}) failed ({:?}):\nstdout: {stdout_txt}\nstderr: {stderr_txt}",
                     out.status.code()
                 );
-                let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-                assert_eq!(
-                    report["summary"]["failed"], 0,
-                    "recurse_verify report: {report}"
-                );
-                assert_eq!(
-                    report["summary"]["incomplete"], 0,
-                    "recurse_verify report had incomplete findings: {report}"
-                );
-            }
-        };
+            let report: Value = serde_json::from_slice(&out.stdout).unwrap();
+            assert_eq!(
+                report["summary"]["failed"], 0,
+                "recurse_verify report: {report}"
+            );
+            assert_eq!(
+                report["summary"]["incomplete"], 0,
+                "recurse_verify report had incomplete findings: {report}"
+            );
+        }
+    };
 
     // Bundle A: Claimed deployment + ES256 Root #1 Endorsements + ES256 Principal (`failed == 0, incomplete == 0`):
     let pre_rotation_records: Vec<_> = std::iter::once(pub_rec.clone())

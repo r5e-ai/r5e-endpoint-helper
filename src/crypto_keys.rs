@@ -107,9 +107,9 @@ impl U384 {
 
     fn to_be_bytes_len(self, out_len: usize) -> Vec<u8> {
         let mut full = [0u8; 48];
-        for i in 0..6 {
+        for (i, limb) in self.0.iter().enumerate() {
             let start = (5 - i) * 8;
-            full[start..start + 8].copy_from_slice(&self.0[i].to_be_bytes());
+            full[start..start + 8].copy_from_slice(&limb.to_be_bytes());
         }
         full[48 - out_len..].to_vec()
     }
@@ -914,7 +914,8 @@ fn decode_hex_bytes(s: &str) -> Option<Vec<u8>> {
         return None;
     }
     let mut out = Vec::with_capacity(s.len() / 2);
-    for chunk in s.as_bytes().chunks_exact(2) {
+    let (chunks, _) = s.as_bytes().as_chunks::<2>();
+    for chunk in chunks {
         let hex_str = std::str::from_utf8(chunk).ok()?;
         out.push(u8::from_str_radix(hex_str, 16).ok()?);
     }

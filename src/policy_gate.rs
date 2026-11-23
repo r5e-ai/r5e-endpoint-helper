@@ -50,6 +50,8 @@ pub struct LocalCedarGate {
     policy_bundle_ref: String,
     posture: Posture,
     offline_mode: bool,
+    policy_labels: HashMap<String, String>,
+    duplicate_id_warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -79,12 +81,55 @@ impl LocalCedarGate {
             .map_err(|err| format!("invalid Cedar policy bundle: {err}"))?;
         let digest = Sha256::digest(cedar_src.as_bytes());
         let policy_bundle_ref = format!("bytes:sha256:{}", hex_lower(&digest));
+
+        let mut annotation_counts: HashMap<String, usize> = HashMap::new();
+        for policy in policies.policies() {
+            if let Some(ann) = policy
+                .annotation("id")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                *annotation_counts.entry(ann.to_string()).or_insert(0) += 1;
+            }
+        }
+
+        let mut policy_labels = HashMap::new();
+        let mut duplicate_id_warnings = Vec::new();
+        for policy in policies.policies() {
+            let pid = policy.id().to_string();
+            let label = match policy
+                .annotation("id")
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+            {
+                Some(ann) if annotation_counts.get(ann).copied().unwrap_or(0) > 1 => {
+                    let disambiguated = format!("{ann}#{pid}");
+                    let warning = format!(
+                        "duplicate Cedar @id({ann:?}) on {pid}; disambiguating as {disambiguated}"
+                    );
+                    eprintln!("r5e-endpoint-helper: warning: {warning}");
+                    duplicate_id_warnings.push(warning);
+                    disambiguated
+                }
+                Some(ann) => ann.to_string(),
+                None => pid.clone(),
+            };
+            policy_labels.insert(pid, label);
+        }
+        duplicate_id_warnings.sort();
+
         Ok(Self {
             policies,
             policy_bundle_ref,
             posture,
             offline_mode,
+            policy_labels,
+            duplicate_id_warnings,
         })
+    }
+
+    pub fn duplicate_id_warnings(&self) -> &[String] {
+        &self.duplicate_id_warnings
     }
 
     pub fn policy_bundle_ref(&self) -> &str {
@@ -200,17 +245,11 @@ impl LocalCedarGate {
             .diagnostics()
             .reason()
             .map(|id| {
-                self.policies
-                    .policy(id)
-                    .and_then(|policy| policy.annotation("id"))
-                    .map(str::trim)
-                    .filter(|ann| !ann.is_empty())
-                    .map(ToOwned::to_owned)
-                    .unwrap_or_else(|| id.to_string())
+                let pid = id.to_string();
+                self.policy_labels.get(&pid).cloned().unwrap_or(pid)
             })
             .collect();
         matching_ids.sort();
-        matching_ids.dedup();
 
         match (response.decision(), self.posture) {
             (Decision::Allow, _) => Ok(GateVerdict {
@@ -382,5 +421,54 @@ forbid (
         assert_eq!(deny.matching_policy_ids, vec!["policy1"]);
         let msg = deny.agent_message.expect("deny agent_message");
         assert!(msg.contains("forbid rule(s): policy1"));
+    }
+
+    #[test]
+    fn duplicate_cedar_id_annotations_are_disambiguated_with_policy_id_and_warn() {
+        let cedar = r#"
+@id("deny-dangerous")
+forbid (
+    principal,
+    action == Recurse::Action::"ExecCommand",
+    resource
+) when {
+    context.program == "rm"
+};
+
+@id("deny-dangerous")
+forbid (
+    principal,
+    action == Recurse::Action::"ExecCommand",
+    resource
+) when {
+    context.command_line like "*-rf*"
+};
+"#;
+        let gate = LocalCedarGate::from_cedar_src(cedar, Posture::Enforce, false)
+            .expect("valid cedar policy");
+        assert_eq!(gate.duplicate_id_warnings().len(), 2);
+        assert!(gate.duplicate_id_warnings()[0].contains("deny-dangerous#policy0"));
+        assert!(gate.duplicate_id_warnings()[1].contains("deny-dangerous#policy1"));
+
+        let deny = gate
+            .evaluate(
+                "agent-1",
+                "urn:r5e:session:test:1",
+                &LocalActionKind::ExecCommand {
+                    program: "rm".to_string(),
+                    argv: vec!["-rf".to_string(), "/tmp/x".to_string()],
+                    command_line: "rm -rf /tmp/x".to_string(),
+                },
+            )
+            .expect("evaluate deny");
+        assert_eq!(
+            deny.matching_policy_ids,
+            vec!["deny-dangerous#policy0", "deny-dangerous#policy1"]
+        );
+        let msg = deny.agent_message.expect("deny agent_message");
+        assert!(
+            msg.contains("forbid rule(s): deny-dangerous#policy0, deny-dangerous#policy1"),
+            "unexpected deny message: {msg}"
+        );
     }
 }
