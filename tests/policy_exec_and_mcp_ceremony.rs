@@ -862,12 +862,14 @@ fn exec_enforce_mode_allows_permitted_blocks_forbidden_77_without_spawning_and_p
 
     let cedar_path = tmp.join("endpoint.cedar");
     let cedar_src = r#"
+@id("allow-echo")
 permit(
     principal == Recurse::Agent::"codex-dev",
     action == Recurse::Action::"ExecCommand",
     resource == Recurse::Resource::"/bin/echo"
 );
 
+@id("deny-shell-exec")
 forbid(
     principal,
     action == Recurse::Action::"ExecCommand",
@@ -999,6 +1001,10 @@ forbid(
     );
     let deny_stderr = String::from_utf8_lossy(&deny_out.stderr);
     assert!(deny_stderr.contains("Blocked on endpoint by organisation policy"));
+    assert!(
+        deny_stderr.contains("forbid rule(s): deny-shell-exec"),
+        "expected @id annotation in deny stderr, got: {deny_stderr}"
+    );
     assert!(!deny_stderr.contains(bearer_secret));
 
     // 5. Inspect admitted stream on mock gateway (`seq 1..=4`):
@@ -1014,6 +1020,14 @@ forbid(
         assert_eq!(
             st.admitted_records[0].payload["body"]["evaluation"]["policyRef"],
             expected_policy_ref
+        );
+        assert_eq!(
+            st.admitted_records[0].payload["body"]["details"]["target"],
+            "/bin/echo"
+        );
+        assert_eq!(
+            st.admitted_records[0].payload["body"]["details"]["matchingPolicyIds"],
+            "allow-echo"
         );
 
         assert_eq!(st.admitted_records[1].kind, "ToolCall");
@@ -1052,6 +1066,20 @@ forbid(
         assert_eq!(
             st.admitted_records[3].payload["body"]["details"]["enforcementOutcome"],
             "prevented"
+        );
+        assert_eq!(
+            st.admitted_records[3].payload["body"]["details"]["target"],
+            "/bin/sh"
+        );
+        assert_eq!(
+            st.admitted_records[3].payload["body"]["details"]["matchingPolicyIds"],
+            "deny-shell-exec"
+        );
+        assert!(
+            st.admitted_records[3].payload["body"]["evaluation"]["reason"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("forbid rule(s): deny-shell-exec")
         );
         (
             st.steward_id.clone(),

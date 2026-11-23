@@ -199,9 +199,18 @@ impl LocalCedarGate {
         let mut matching_ids: Vec<String> = response
             .diagnostics()
             .reason()
-            .map(|id| id.to_string())
+            .map(|id| {
+                self.policies
+                    .policy(id)
+                    .and_then(|policy| policy.annotation("id"))
+                    .map(str::trim)
+                    .filter(|ann| !ann.is_empty())
+                    .map(ToOwned::to_owned)
+                    .unwrap_or_else(|| id.to_string())
+            })
             .collect();
         matching_ids.sort();
+        matching_ids.dedup();
 
         match (response.decision(), self.posture) {
             (Decision::Allow, _) => Ok(GateVerdict {
@@ -252,4 +261,126 @@ pub fn hex_lower(bytes: &[u8]) -> String {
         let _ = write!(&mut s, "{b:02x}");
     }
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cedar_id_annotation_replaces_positional_policy_id_in_verdict_and_reason() {
+        let cedar = r#"
+@id("allow-spec-tools")
+permit (
+    principal,
+    action == Recurse::Action::"ExecCommand",
+    resource
+) when {
+    context.program == "wc"
+};
+
+@id("deny-secret-or-external-network")
+forbid (
+    principal,
+    action == Recurse::Action::"ExecCommand",
+    resource
+) when {
+    context.program == "curl"
+};
+"#;
+        let gate = LocalCedarGate::from_cedar_src(cedar, Posture::Enforce, false)
+            .expect("valid cedar policy");
+
+        let allow = gate
+            .evaluate(
+                "agent-1",
+                "urn:r5e:session:test:1",
+                &LocalActionKind::ExecCommand {
+                    program: "wc".to_string(),
+                    argv: vec!["-l".to_string(), "README.md".to_string()],
+                    command_line: "wc -l README.md".to_string(),
+                },
+            )
+            .expect("evaluate allow");
+        assert!(allow.allowed_to_execute);
+        assert_eq!(allow.matching_policy_ids, vec!["allow-spec-tools"]);
+
+        let deny = gate
+            .evaluate(
+                "agent-1",
+                "urn:r5e:session:test:1",
+                &LocalActionKind::ExecCommand {
+                    program: "curl".to_string(),
+                    argv: vec!["https://example.com".to_string()],
+                    command_line: "curl https://example.com".to_string(),
+                },
+            )
+            .expect("evaluate deny");
+        assert!(!deny.allowed_to_execute);
+        assert_eq!(
+            deny.matching_policy_ids,
+            vec!["deny-secret-or-external-network"]
+        );
+        let msg = deny.agent_message.expect("deny agent_message");
+        assert!(
+            msg.contains("forbid rule(s): deny-secret-or-external-network"),
+            "unexpected deny message: {msg}"
+        );
+        assert!(
+            !msg.contains("policy1"),
+            "positional policy id leaked into deny message: {msg}"
+        );
+    }
+
+    #[test]
+    fn cedar_missing_or_blank_id_annotation_falls_back_to_positional_policy_id() {
+        let cedar = r#"
+permit (
+    principal,
+    action == Recurse::Action::"ExecCommand",
+    resource
+) when {
+    context.program == "echo"
+};
+
+@id("   ")
+forbid (
+    principal,
+    action == Recurse::Action::"ExecCommand",
+    resource
+) when {
+    context.program == "rm"
+};
+"#;
+        let gate = LocalCedarGate::from_cedar_src(cedar, Posture::Enforce, false)
+            .expect("valid cedar policy");
+
+        let allow = gate
+            .evaluate(
+                "agent-1",
+                "urn:r5e:session:test:1",
+                &LocalActionKind::ExecCommand {
+                    program: "echo".to_string(),
+                    argv: vec!["hi".to_string()],
+                    command_line: "echo hi".to_string(),
+                },
+            )
+            .expect("evaluate allow");
+        assert_eq!(allow.matching_policy_ids, vec!["policy0"]);
+
+        let deny = gate
+            .evaluate(
+                "agent-1",
+                "urn:r5e:session:test:1",
+                &LocalActionKind::ExecCommand {
+                    program: "rm".to_string(),
+                    argv: vec!["-rf".to_string(), "/tmp/x".to_string()],
+                    command_line: "rm -rf /tmp/x".to_string(),
+                },
+            )
+            .expect("evaluate deny");
+        assert_eq!(deny.matching_policy_ids, vec!["policy1"]);
+        let msg = deny.agent_message.expect("deny agent_message");
+        assert!(msg.contains("forbid rule(s): policy1"));
+    }
 }

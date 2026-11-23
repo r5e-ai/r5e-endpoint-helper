@@ -5623,7 +5623,7 @@ fn run_exec_subcommand(
         &verdict,
         posture,
         "ExecCommand",
-        &command_line,
+        &program,
     ) {
         Ok(rec) => rec,
         Err(err) => {
