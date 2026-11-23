@@ -1,3 +1,4 @@
+pub mod agent_hooks;
 pub mod attestation;
 pub mod claim_http;
 pub mod crypto_keys;
