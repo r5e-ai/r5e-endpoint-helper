@@ -256,7 +256,60 @@ pub fn redact_string(input: &str) -> String {
         break;
     }
 
-    // 2. Redact `Bearer <token>` (case-insensitive).
+    // 2. Redact `Authorization:` and `Cookie:` header values (case-insensitive).
+    for header in ["authorization:", "cookie:"] {
+        let mut idx = 0usize;
+        while idx < s.len() {
+            let lower = s[idx..].to_ascii_lowercase();
+            let Some(rel) = lower.find(header) else {
+                break;
+            };
+            let hdr_start = idx + rel;
+            let val_start = hdr_start + header.len();
+            let bytes = s.as_bytes();
+            let mut val_end = val_start;
+            while val_end < bytes.len() && !matches!(bytes[val_end], b'\r' | b'\n' | b'\'' | b'"') {
+                val_end += 1;
+            }
+            if val_end > val_start && !s[val_start..val_end].trim().starts_with("[REDACTED]") {
+                let replacement = format!("{} [REDACTED]", &s[hdr_start..val_start]);
+                let repl_len = replacement.len();
+                s.replace_range(hdr_start..val_end, &replacement);
+                idx = hdr_start + repl_len;
+            } else {
+                idx = val_end.max(val_start + 1);
+            }
+        }
+    }
+
+    // 3. Redact URL userinfo credentials (`scheme://user:pass@host` -> `scheme://[REDACTED]@host`).
+    {
+        let mut idx = 0usize;
+        while let Some(rel) = s[idx..].find("://") {
+            let auth_start = idx + rel + 3;
+            let bytes = s.as_bytes();
+            let mut end = auth_start;
+            while end < bytes.len()
+                && !matches!(
+                    bytes[end],
+                    b'/' | b'?' | b'#' | b' ' | b'\t' | b'\r' | b'\n' | b'\'' | b'"'
+                )
+            {
+                end += 1;
+            }
+            if let Some(at_rel) = s[auth_start..end].rfind('@') {
+                let userinfo = &s[auth_start..auth_start + at_rel];
+                if userinfo.contains(':') && userinfo != "[REDACTED]" {
+                    s.replace_range(auth_start..auth_start + at_rel, "[REDACTED]");
+                    idx = auth_start + "[REDACTED]".len() + 1;
+                    continue;
+                }
+            }
+            idx = end.max(auth_start);
+        }
+    }
+
+    // 4. Redact `Bearer <token>` (case-insensitive).
     loop {
         let lower = s.to_ascii_lowercase();
         let Some(pos) = lower.find("bearer ") else {
@@ -278,7 +331,7 @@ pub fn redact_string(input: &str) -> String {
         }
     }
 
-    // 3. Redact JWTs (`eyJ<part1>.<part2>.<part3>`).
+    // 5. Redact JWTs (`eyJ<part1>.<part2>.<part3>`).
     let mut search_from = 0usize;
     while let Some(rel) = s[search_from..].find("eyJ") {
         let start = search_from + rel;
@@ -297,8 +350,14 @@ pub fn redact_string(input: &str) -> String {
         }
     }
 
-    // 4. Redact well-known key prefixes (`sk-`, `pk-`, `rk-`, `whsec_`, `ghp_`, `gho_`, `github_pat_`, `xoxb-`, `xoxp-`, `AIza`).
+    // 6. Redact well-known key prefixes (OpenAI, Anthropic, AWS, GitHub, Stripe, Slack, Google).
     const PREFIXES: &[&str] = &[
+        "sk-ant-",
+        "sk_live_",
+        "sk_test_",
+        "rk_live_",
+        "rk_test_",
+        "pk_live_",
         "sk-",
         "pk-",
         "rk-",
@@ -307,8 +366,13 @@ pub fn redact_string(input: &str) -> String {
         "gho_",
         "github_pat_",
         "xoxb-",
+        "xoxa-",
         "xoxp-",
+        "xoxr-",
+        "xoxs-",
         "AIza",
+        "AKIA",
+        "ASIA",
     ];
     for prefix in PREFIXES {
         let mut idx = 0usize;
@@ -328,13 +392,15 @@ pub fn redact_string(input: &str) -> String {
         }
     }
 
-    // 5. Redact sensitive inline env var assignments (`R5E_TOKEN=...`, etc.).
+    // 7. Redact sensitive inline env var assignments (`R5E_TOKEN=...`, etc.).
     const ENV_VARS: &[&str] = &[
         "R5E_TOKEN=",
         "GOOGLE_VERTEX_API_KEY=",
         "OPENAI_API_KEY=",
         "ANTHROPIC_API_KEY=",
         "FLY_API_TOKEN=",
+        "AWS_SECRET_ACCESS_KEY=",
+        "STRIPE_API_KEY=",
     ];
     for env_prefix in ENV_VARS {
         let mut idx = 0usize;
@@ -581,49 +647,235 @@ fn append_hook_log(state_dir: &Path, msg: &str) {
     let _ = append_line_0600(&state_dir.join("hook.log"), &format!("{ts} {msg}"));
 }
 
-fn build_cedar_action_for_hook(ev: &QueuedHookEvent) -> LocalActionKind {
-    let tool = ev.tool_name.as_deref().unwrap_or("unknown_tool");
-    let cmd_str = ev
-        .args
-        .get("CommandLine")
-        .or_else(|| ev.args.get("command"))
-        .or_else(|| ev.args.get("cmd"))
-        .and_then(Value::as_str);
+fn extract_raw_args_for_client(client: HookClient, payload: &Value) -> Value {
+    match client {
+        HookClient::Antigravity => payload
+            .get("toolCall")
+            .and_then(|v| v.get("args"))
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+        HookClient::ClaudeCode => payload
+            .get("tool_input")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+        HookClient::Codex => payload
+            .get("arguments")
+            .or_else(|| payload.get("args"))
+            .cloned()
+            .unwrap_or_else(|| json!({})),
+    }
+}
 
-    if matches!(tool, "run_command" | "Bash" | "bash" | "shell" | "exec") {
-        if let Some(cmd) = cmd_str {
-            let parts: Vec<String> = cmd.split_whitespace().map(ToOwned::to_owned).collect();
-            let program = parts
-                .first()
-                .map(|p| {
-                    Path::new(p)
-                        .file_name()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or(p)
-                        .to_string()
-                })
-                .unwrap_or_else(|| tool.to_string());
-            let argv = if parts.len() > 1 {
-                parts[1..].to_vec()
+/// POSIX-like shell word splitter handling single quotes, double quotes, and backslash escapes.
+pub fn split_shell_words(input: &str) -> Vec<String> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+    let mut has_token = false;
+
+    for ch in input.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            has_token = true;
+            continue;
+        }
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
             } else {
-                Vec::new()
-            };
-            return LocalActionKind::ExecCommand {
-                program,
-                argv,
-                command_line: cmd.to_string(),
-            };
+                current.push(ch);
+            }
+            has_token = true;
+            continue;
+        }
+        if in_double {
+            match ch {
+                '"' => in_double = false,
+                '\\' => escaped = true,
+                _ => current.push(ch),
+            }
+            has_token = true;
+            continue;
+        }
+        match ch {
+            '\'' => {
+                in_single = true;
+                has_token = true;
+            }
+            '"' => {
+                in_double = true;
+                has_token = true;
+            }
+            '\\' => {
+                escaped = true;
+                has_token = true;
+            }
+            c if c.is_whitespace() => {
+                if has_token {
+                    words.push(std::mem::take(&mut current));
+                    has_token = false;
+                }
+            }
+            _ => {
+                current.push(ch);
+                has_token = true;
+            }
         }
     }
+    if escaped {
+        current.push('\\');
+    }
+    if has_token {
+        words.push(current);
+    }
+    words
+}
 
-    let args_bytes = serde_json::to_vec(&ev.args).unwrap_or_default();
+fn basename_of(program: &str) -> String {
+    Path::new(program)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .filter(|s| !s.is_empty())
+        .unwrap_or(program)
+        .to_string()
+}
+
+fn is_shell_binary(basename: &str) -> bool {
+    matches!(
+        basename,
+        "sh" | "bash" | "zsh" | "dash" | "ksh" | "fish" | "ash" | "csh" | "tcsh"
+    )
+}
+
+fn is_shell_tool_name(tool: &str) -> bool {
+    matches!(
+        tool,
+        "run_command"
+            | "Bash"
+            | "bash"
+            | "sh"
+            | "shell"
+            | "shell_command"
+            | "local_shell"
+            | "exec"
+            | "exec_command"
+            | "terminal"
+    )
+}
+
+fn extract_shell_wrapper_inner(program: &str, argv: &[String]) -> Option<String> {
+    if !is_shell_binary(program) {
+        return None;
+    }
+    for (idx, flag) in argv.iter().enumerate() {
+        if flag == "-c"
+            || (flag.starts_with('-')
+                && !flag.starts_with("--")
+                && flag.chars().skip(1).all(|c| c.is_ascii_alphabetic())
+                && flag.contains('c'))
+        {
+            if let Some(inner) = argv.get(idx + 1) {
+                if !inner.trim().is_empty() {
+                    return Some(inner.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Builds one or more Cedar actions to evaluate from the **raw (unredacted, untruncated)**
+/// tool arguments.
+///
+/// Handles quoted shell commands, Codex array `command` (`["bash", "-lc", "..."]`), and
+/// `sh -c`/`bash -lc` shell wrappers (evaluating both the outer wrapper and unwrapped
+/// inner command so forbid rules on either cannot be bypassed).
+pub fn build_cedar_actions_for_hook(
+    client: HookClient,
+    tool_name: Option<&str>,
+    raw_args: &Value,
+) -> Vec<LocalActionKind> {
+    let tool = tool_name.unwrap_or("unknown_tool");
+
+    // 1. Codex / exec array `command` or `argv` (`["bash", "-lc", "rm -rf /"]`).
+    let array_cmd: Option<Vec<String>> = raw_args
+        .get("command")
+        .or_else(|| raw_args.get("argv"))
+        .or_else(|| raw_args.get("cmd"))
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(ToOwned::to_owned)
+                .collect::<Vec<_>>()
+        })
+        .filter(|v| !v.is_empty());
+
+    let string_cmd: Option<&str> = raw_args
+        .get("CommandLine")
+        .or_else(|| raw_args.get("command"))
+        .or_else(|| raw_args.get("cmd"))
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty());
+
+    let parsed_parts: Option<(Vec<String>, String)> = if let Some(parts) = array_cmd {
+        let joined = parts.join(" ");
+        Some((parts, joined))
+    } else if let Some(cmd) =
+        string_cmd.filter(|_| is_shell_tool_name(tool) || raw_args.get("CommandLine").is_some())
+    {
+        let parts = split_shell_words(cmd);
+        if parts.is_empty() {
+            None
+        } else {
+            Some((parts, cmd.to_string()))
+        }
+    } else {
+        None
+    };
+
+    if let Some((parts, full_cmd_line)) = parsed_parts {
+        let program = basename_of(&parts[0]);
+        let argv = if parts.len() > 1 {
+            parts[1..].to_vec()
+        } else {
+            Vec::new()
+        };
+        let mut actions = vec![LocalActionKind::ExecCommand {
+            program: program.clone(),
+            argv: argv.clone(),
+            command_line: full_cmd_line,
+        }];
+        if let Some(inner_cmd) = extract_shell_wrapper_inner(&program, &argv) {
+            let inner_parts = split_shell_words(&inner_cmd);
+            if let Some(first_inner) = inner_parts.first() {
+                let inner_prog = basename_of(first_inner);
+                let inner_argv = if inner_parts.len() > 1 {
+                    inner_parts[1..].to_vec()
+                } else {
+                    Vec::new()
+                };
+                actions.push(LocalActionKind::ExecCommand {
+                    program: inner_prog,
+                    argv: inner_argv,
+                    command_line: inner_cmd,
+                });
+            }
+        }
+        return actions;
+    }
+
+    let args_bytes = serde_json::to_vec(raw_args).unwrap_or_default();
     let args_sha = hex_lower(&Sha256::digest(&args_bytes));
-    LocalActionKind::McpToolCall {
-        server_id: ev.client.as_str().to_string(),
+    vec![LocalActionKind::McpToolCall {
+        server_id: client.as_str().to_string(),
         tool_name: tool.to_string(),
         descriptor_sha256: None,
         arguments_sha256: Some(args_sha),
-    }
+    }]
 }
 
 fn default_stdout_for_event(client: HookClient, kind: NormalizedEventKind) -> Value {
@@ -645,29 +897,49 @@ fn enforce_block_response(client: HookClient, reason: &str) -> Value {
 /// Runs the fast synchronous stdin -> stdout hook path.
 ///
 /// In `observe` mode, errors are logged and swallowed so the hook remains strictly
-/// fail-open (`exit 0` + valid client JSON). In `enforce` mode, `PreToolUse` ALWAYS
-/// fails **closed** (missing `--cedar-policy`, unreadable/invalid Cedar, or evaluation
-/// error all return `deny`/`block`).
+/// fail-open (`exit 0` + valid client JSON). In `enforce` mode:
+/// - Empty stdin, malformed JSON, or unrecognized event names ALWAYS fail closed.
+/// - Cedar is evaluated against the **real (pre-redaction, pre-truncation)** args first;
+///   redaction and 16 KiB capping are applied only to queued/stored telemetry.
+/// - Missing `--cedar-policy`, unreadable/invalid Cedar, or any Cedar eval error fails closed.
 pub fn run_hook_invocation(stdin_raw: &str, opts: &HookRunOptions) -> Value {
-    let payload: Value = if stdin_raw.trim().is_empty() {
-        json!({})
-    } else {
-        match serde_json::from_str(stdin_raw) {
-            Ok(v) => v,
-            Err(err) => {
-                append_hook_log(&opts.state_dir, &format!("hook invalid stdin JSON: {err}"));
-                if opts.mode == HookMode::Enforce {
-                    return enforce_block_response(
-                        opts.client,
-                        "Policy unavailable: malformed hook payload in enforce mode",
-                    );
-                }
-                json!({})
+    if stdin_raw.trim().is_empty() {
+        if opts.mode == HookMode::Enforce {
+            append_hook_log(
+                &opts.state_dir,
+                "enforce fail-closed: unrecognized_or_empty_hook_event (empty stdin)",
+            );
+            return enforce_block_response(opts.client, "unrecognized_or_empty_hook_event");
+        }
+        return json!({});
+    }
+
+    let payload: Value = match serde_json::from_str(stdin_raw) {
+        Ok(v) => v,
+        Err(err) => {
+            append_hook_log(&opts.state_dir, &format!("hook invalid stdin JSON: {err}"));
+            if opts.mode == HookMode::Enforce {
+                return enforce_block_response(
+                    opts.client,
+                    "Policy unavailable: malformed hook payload in enforce mode",
+                );
             }
+            json!({})
         }
     };
 
+    // Extract raw (unredacted, untruncated) args BEFORE normalization/redaction for Cedar.
+    let raw_args = extract_raw_args_for_client(opts.client, &payload);
     let mut ev = normalize_hook_payload(opts.client, opts.mode, &payload);
+
+    if opts.mode == HookMode::Enforce && ev.event_kind == NormalizedEventKind::Unknown {
+        append_hook_log(
+            &opts.state_dir,
+            "enforce fail-closed: unrecognized_or_empty_hook_event",
+        );
+        return enforce_block_response(opts.client, "unrecognized_or_empty_hook_event");
+    }
+
     let mut response = default_stdout_for_event(opts.client, ev.event_kind);
 
     if opts.mode == HookMode::Enforce && ev.event_kind == NormalizedEventKind::PreToolUse {
@@ -677,7 +949,6 @@ pub fn run_hook_invocation(stdin_raw: &str, opts: &HookRunOptions) -> Value {
             ev.enforce_outcome = Some("deny".to_string());
             ev.enforce_reason = Some(reason.to_string());
             response = enforce_block_response(opts.client, reason);
-            // Queue the denied PolicyDecision before returning.
             let sess_dir = opts.state_dir.join("sessions").join(&ev.conversation_id);
             if ensure_dir_0700(&sess_dir).is_ok() {
                 if let Ok(line) = serde_json::to_string(&ev) {
@@ -692,32 +963,46 @@ pub fn run_hook_invocation(stdin_raw: &str, opts: &HookRunOptions) -> Value {
             .and_then(|src| LocalCedarGate::from_cedar_src(&src, Posture::Enforce, false))
         {
             Ok(gate) => {
-                let action = build_cedar_action_for_hook(&ev);
-                match gate.evaluate(
-                    opts.client.as_str(),
-                    &format!("urn:r5e:session:hook:{}", ev.conversation_id),
-                    &action,
-                ) {
-                    Ok(verdict) => {
-                        ev.enforce_outcome = Some(verdict.cedar_decision.clone());
-                        ev.enforce_policy_ref = Some(verdict.policy_bundle_ref.clone());
-                        ev.enforce_matching_ids = verdict.matching_policy_ids.clone();
-                        ev.enforce_reason = verdict.agent_message.clone();
-                        if !verdict.allowed_to_execute {
-                            let reason = verdict.agent_message.unwrap_or_else(|| {
-                                "Blocked by organisation Cedar policy".to_string()
-                            });
-                            response = enforce_block_response(opts.client, &reason);
-                        } else if opts.client == HookClient::Antigravity {
-                            response = json!({"decision": "allow"});
+                let actions =
+                    build_cedar_actions_for_hook(opts.client, ev.tool_name.as_deref(), &raw_args);
+                let session_ctx = format!("urn:r5e:session:hook:{}", ev.conversation_id);
+                let mut final_verdict = None;
+                let mut eval_error: Option<String> = None;
+
+                for action in &actions {
+                    match gate.evaluate(opts.client.as_str(), &session_ctx, action) {
+                        Ok(verdict) => {
+                            let denied = !verdict.allowed_to_execute;
+                            final_verdict = Some(verdict);
+                            if denied {
+                                break;
+                            }
+                        }
+                        Err(err) => {
+                            eval_error = Some(err);
+                            break;
                         }
                     }
-                    Err(err) => {
-                        let reason = format!("Policy evaluation error (cedar_eval_error): {err}");
-                        append_hook_log(&opts.state_dir, &reason);
-                        ev.enforce_outcome = Some("deny".to_string());
-                        ev.enforce_reason = Some(reason.clone());
+                }
+
+                if let Some(err) = eval_error {
+                    let reason = format!("Policy evaluation error (cedar_eval_error): {err}");
+                    append_hook_log(&opts.state_dir, &reason);
+                    ev.enforce_outcome = Some("deny".to_string());
+                    ev.enforce_reason = Some(reason.clone());
+                    response = enforce_block_response(opts.client, &reason);
+                } else if let Some(verdict) = final_verdict {
+                    ev.enforce_outcome = Some(verdict.cedar_decision.clone());
+                    ev.enforce_policy_ref = Some(verdict.policy_bundle_ref.clone());
+                    ev.enforce_matching_ids = verdict.matching_policy_ids.clone();
+                    ev.enforce_reason = verdict.agent_message.clone();
+                    if !verdict.allowed_to_execute {
+                        let reason = verdict
+                            .agent_message
+                            .unwrap_or_else(|| "Blocked by organisation Cedar policy".to_string());
                         response = enforce_block_response(opts.client, &reason);
+                    } else if opts.client == HookClient::Antigravity {
+                        response = json!({"decision": "allow"});
                     }
                 }
             }
@@ -1112,13 +1397,13 @@ fn append_queued_event_to_state(
                 Value::String(if has_error { "failed" } else { "completed" }.to_string()),
             );
             tr_body.insert("details".to_string(), Value::Object(tr_details));
-            if let Some(ref err_str) = ev.error {
-                if !err_str.trim().is_empty() {
-                    tr_body.insert(
-                        "reason".to_string(),
-                        Value::String(truncate_utf8_bytes(err_str, 512)),
-                    );
-                }
+            // Keep raw tool error text strictly inside the erasable contentRef blob;
+            // permanent ToolResult.body.reason carries only a closed generic code.
+            if has_error {
+                tr_body.insert(
+                    "reason".to_string(),
+                    Value::String("tool_error".to_string()),
+                );
             }
             state.append_workload_record(
                 "events",
@@ -1227,24 +1512,70 @@ pub fn drain_conversation(conv_id: &str, opts: &HookRunOptions) -> Result<(), St
             }
 
             let pending = &lines[cursor..];
-            let first_ev: QueuedHookEvent =
-                serde_json::from_str(pending[0]).map_err(|e| format!("parse queued event: {e}"))?;
+            // Skip any leading empty or corrupt JSONL lines so a single bad line never wedges the queue.
+            let mut first_valid_idx = None;
+            let mut first_ev: Option<QueuedHookEvent> = None;
+            for (offset, line) in pending.iter().enumerate() {
+                if line.trim().is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<QueuedHookEvent>(line) {
+                    Ok(ev) => {
+                        first_valid_idx = Some(offset);
+                        first_ev = Some(ev);
+                        break;
+                    }
+                    Err(err) => {
+                        append_hook_log(
+                            &opts.state_dir,
+                            &format!(
+                                "drain skipping corrupt JSONL line {} in conv={safe_id}: {err}",
+                                cursor + offset + 1
+                            ),
+                        );
+                    }
+                }
+            }
+            let Some(first_ev) = first_ev else {
+                fs::write(&cursor_path, lines.len().to_string())
+                    .map_err(|e| format!("write cursor: {e}"))?;
+                break;
+            };
+            let start_offset = first_valid_idx.unwrap_or(0);
+            if start_offset > 0 {
+                fs::write(&cursor_path, (cursor + start_offset).to_string())
+                    .map_err(|e| format!("write cursor: {e}"))?;
+            }
+
             let mut state =
                 ensure_enrolled_and_opened(&session_dir, &safe_id, &first_ev, opts, &bearer_token)?;
             meta.badge_ref = Some(state.badge_ref.clone());
             meta.session_urn = state.session_urn.clone();
 
-            let mut processed = 0usize;
+            let mut processed = start_offset;
             let mut did_record = false;
-            for line in pending {
+            for line in &pending[start_offset..] {
                 if line.trim().is_empty() {
                     processed += 1;
+                    fs::write(&cursor_path, (cursor + processed).to_string())
+                        .map_err(|e| format!("write cursor: {e}"))?;
                     continue;
                 }
-                let ev: QueuedHookEvent =
-                    serde_json::from_str(line).map_err(|e| format!("parse queued event: {e}"))?;
-                if append_queued_event_to_state(&mut state, &ev)? {
-                    did_record = true;
+                match serde_json::from_str::<QueuedHookEvent>(line) {
+                    Ok(ev) => {
+                        if append_queued_event_to_state(&mut state, &ev)? {
+                            did_record = true;
+                        }
+                    }
+                    Err(err) => {
+                        append_hook_log(
+                            &opts.state_dir,
+                            &format!(
+                                "drain skipping corrupt JSONL line {} in conv={safe_id}: {err}",
+                                cursor + processed + 1
+                            ),
+                        );
+                    }
                 }
                 processed += 1;
                 fs::write(&cursor_path, (cursor + processed).to_string())
@@ -1446,9 +1777,90 @@ pub fn install_hooks_config(opts: &InstallHooksOptions) -> Result<PathBuf, Strin
 
     let formatted = serde_json::to_string_pretty(&root)
         .map_err(|e| format!("format {}: {e}", config_path.display()))?;
-    fs::write(&config_path, format!("{formatted}\n"))
-        .map_err(|e| format!("write {}: {e}", config_path.display()))?;
+    write_string_atomic(&config_path, &format!("{formatted}\n"))?;
     Ok(config_path)
+}
+
+fn write_string_atomic(path: &Path, content: &str) -> Result<(), String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    let file_name = path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("hooks.json");
+    let tmp_path = parent.join(format!(
+        ".{file_name}.tmp.{}.{}",
+        std::process::id(),
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
+    fs::write(&tmp_path, content).map_err(|e| format!("write temp {}: {e}", tmp_path.display()))?;
+    fs::rename(&tmp_path, path).map_err(|e| {
+        let _ = fs::remove_file(&tmp_path);
+        format!("rename {} -> {}: {e}", tmp_path.display(), path.display())
+    })
+}
+
+/// Removes `r5e-endpoint-helper` hook entries for the target agent client without
+/// disturbing other user hooks, writing the updated config atomically.
+pub fn uninstall_hooks_config(
+    client: HookClient,
+    target_dir: &Path,
+) -> Result<(PathBuf, bool), String> {
+    let config_path = match client {
+        HookClient::Antigravity | HookClient::Codex => target_dir.join("hooks.json"),
+        HookClient::ClaudeCode => target_dir.join("settings.json"),
+    };
+    if !config_path.is_file() {
+        return Ok((config_path, false));
+    }
+    let raw = fs::read_to_string(&config_path)
+        .map_err(|e| format!("read {}: {e}", config_path.display()))?;
+    if raw.trim().is_empty() {
+        return Ok((config_path, false));
+    }
+    let mut root: Value = serde_json::from_str(&raw)
+        .map_err(|e| format!("parse existing {}: {e}", config_path.display()))?;
+    let root_obj = root.as_object_mut().ok_or_else(|| {
+        format!(
+            "{} must contain a top-level JSON object",
+            config_path.display()
+        )
+    })?;
+
+    let mut removed = false;
+    match client {
+        HookClient::Antigravity => {
+            for key in ["r5e-observe", "r5e-enforce"] {
+                if root_obj.remove(key).is_some() {
+                    removed = true;
+                }
+            }
+        }
+        HookClient::ClaudeCode | HookClient::Codex => {
+            if let Some(hooks_obj) = root_obj.get_mut("hooks").and_then(Value::as_object_mut) {
+                for event_key in ["SessionStart", "PreToolUse", "PostToolUse", "Stop"] {
+                    if let Some(arr) = hooks_obj.get_mut(event_key).and_then(Value::as_array_mut) {
+                        let before = arr.len();
+                        arr.retain(|item| {
+                            let s = serde_json::to_string(item).unwrap_or_default();
+                            !s.contains("r5e-endpoint-helper")
+                        });
+                        if arr.len() < before {
+                            removed = true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if removed {
+        let formatted = serde_json::to_string_pretty(&root)
+            .map_err(|e| format!("format {}: {e}", config_path.display()))?;
+        write_string_atomic(&config_path, &format!("{formatted}\n"))?;
+    }
+    Ok((config_path, removed))
 }
 
 /// Collects a machine-readable status snapshot for the desktop tray / Tauri app.
@@ -1817,5 +2229,309 @@ forbid (
             sanitize_conversation_id(Some("conv_123-abc")),
             "conv_123-abc"
         );
+    }
+
+    #[test]
+    fn redacts_broadened_secret_patterns_including_aws_stripe_slack_anthropic_userinfo_and_headers()
+    {
+        let input = json!({
+            "anthropic": "sk-ant-api03-abcdefghijklmnop123456",
+            "aws1": "AKIAIOSFODNN7EXAMPLE",
+            "aws2": "ASIAIOSFODNN7EXAMPLE",
+            "stripe": "sk_live_51abcdef1234567890 and rk_live_99abcdef1234567890",
+            "slack": "xoxb-123456789012-abcdef and xoxp-987654321098-xyzabc",
+            "google": "AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGqe",
+            "url": "https://alice:supersecretpass@db.example.com/app",
+            "hdr": "Authorization: Basic dXNlcjpwYXNz\nCookie: session_id=topsecretcookie123",
+            "pem": "-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC\n-----END PRIVATE KEY-----",
+            "safe": "normal value"
+        });
+        let redacted = redact_json_value(&input, 0);
+        let dumped = serde_json::to_string(&redacted).unwrap();
+        for leaked in [
+            "sk-ant-api03-abcdefghijklmnop123456",
+            "AKIAIOSFODNN7EXAMPLE",
+            "ASIAIOSFODNN7EXAMPLE",
+            "sk_live_51abcdef1234567890",
+            "rk_live_99abcdef1234567890",
+            "xoxb-123456789012-abcdef",
+            "xoxp-987654321098-xyzabc",
+            "AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGqe",
+            "supersecretpass",
+            "dXNlcjpwYXNz",
+            "topsecretcookie123",
+            "MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC",
+        ] {
+            assert!(
+                !dumped.contains(leaked),
+                "secret leaked: {leaked} in {dumped}"
+            );
+        }
+        assert!(dumped.contains("https://[REDACTED]@db.example.com/app"));
+        assert_eq!(redacted["safe"], "normal value");
+    }
+
+    #[test]
+    fn enforce_mode_closes_all_four_bypasses_empty_unknown_truncation_shell_and_codex_array() {
+        let dir = temp_dir("enforce-4-bypasses");
+        let cedar_path = dir.join("forbid.cedar");
+        fs::write(
+            &cedar_path,
+            r#"
+@id("permit-all-exec")
+permit (
+    principal,
+    action == Recurse::Action::"ExecCommand",
+    resource
+);
+
+@id("forbid-rm-or-secret-marker")
+forbid (
+    principal,
+    action == Recurse::Action::"ExecCommand",
+    resource
+) when {
+    context.program == "rm" ||
+    context.program == "curl" ||
+    context.command_line like "*FORBIDDEN_TAIL_MARKER*"
+};
+"#,
+        )
+        .unwrap();
+
+        let opts = HookRunOptions {
+            client: HookClient::Antigravity,
+            mode: HookMode::Enforce,
+            gateway_url: "http://127.0.0.1:4000".to_string(),
+            state_dir: dir.clone(),
+            bearer_token_env: "R5E_TOKEN".to_string(),
+            bearer_token_file: None,
+            cedar_policy: Some(cedar_path.clone()),
+            spawn_drainer: false,
+        };
+
+        // Bypass 1a: Empty stdin -> denied
+        let empty_out = run_hook_invocation("   ", &opts);
+        assert_eq!(empty_out["decision"], "deny");
+        assert_eq!(empty_out["reason"], "unrecognized_or_empty_hook_event");
+
+        // Bypass 1b: Unrecognized event name -> denied (and block for Codex)
+        let unknown_out = run_hook_invocation(
+            r#"{"hookEventName":"SomeFutureEvent","conversationId":"c1"}"#,
+            &opts,
+        );
+        assert_eq!(unknown_out["decision"], "deny");
+        assert_eq!(unknown_out["reason"], "unrecognized_or_empty_hook_event");
+
+        let codex_opts = HookRunOptions {
+            client: HookClient::Codex,
+            ..opts.clone()
+        };
+        let codex_unknown = run_hook_invocation(r#"{"event":"mystery_event"}"#, &codex_opts);
+        assert_eq!(codex_unknown["decision"], "block");
+        assert_eq!(codex_unknown["reason"], "unrecognized_or_empty_hook_event");
+
+        // Bypass 2: Payload > 4096 bytes with forbidden marker past truncation point -> STILL denied!
+        let long_cmd = format!("echo {} FORBIDDEN_TAIL_MARKER", "a".repeat(5000));
+        let long_payload = json!({
+            "hookEventName": "PreToolUse",
+            "conversationId": "c-long",
+            "toolCall": {
+                "id": "tc-long",
+                "name": "run_command",
+                "args": {"CommandLine": long_cmd}
+            }
+        });
+        let long_out = run_hook_invocation(&long_payload.to_string(), &opts);
+        assert_eq!(
+            long_out["decision"], "deny",
+            "Cedar must evaluate pre-truncation command line"
+        );
+        assert!(long_out["reason"]
+            .as_str()
+            .unwrap()
+            .contains("forbid-rm-or-secret-marker"));
+
+        // Bypass 3a: Quoted `sh -c 'curl https://evil.example'` -> unwrapped and denied!
+        let sh_payload = json!({
+            "hookEventName": "PreToolUse",
+            "conversationId": "c-sh",
+            "toolCall": {
+                "id": "tc-sh",
+                "name": "run_command",
+                "args": {"CommandLine": "sh -c 'curl https://evil.example'"}
+            }
+        });
+        let sh_out = run_hook_invocation(&sh_payload.to_string(), &opts);
+        assert_eq!(sh_out["decision"], "deny");
+        assert!(sh_out["reason"]
+            .as_str()
+            .unwrap()
+            .contains("forbid-rm-or-secret-marker"));
+
+        // Bypass 3b: Codex array `command`: `["bash", "-lc", "rm -rf /tmp/demo"]` -> classified as ExecCommand and blocked!
+        let codex_arr_payload = json!({
+            "event": "PreToolUse",
+            "session_id": "c-codex",
+            "tool_name": "local_shell",
+            "call_id": "cx-1",
+            "arguments": {"command": ["bash", "-lc", "rm -rf /tmp/demo"]}
+        });
+        let codex_out = run_hook_invocation(&codex_arr_payload.to_string(), &codex_opts);
+        assert_eq!(codex_out["decision"], "block");
+        assert!(codex_out["reason"]
+            .as_str()
+            .unwrap()
+            .contains("forbid-rm-or-secret-marker"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tool_result_permanent_reason_uses_closed_code_not_raw_error_text() {
+        use crate::attestation::{
+            decode_strict_base64, ed25519_key_id, CaptureProfile, EndpointBundleRecorder,
+        };
+        use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
+        use base64::Engine;
+
+        let seed = [7u8; 32];
+        let sk = SigningKey::from_bytes(&seed);
+        let key_id = ed25519_key_id(sk.verifying_key().as_bytes());
+        let policy_ref =
+            "bytes:sha256:0000000000000000000000000000000000000000000000000000000000000000"
+                .to_string();
+        let profile = CaptureProfile {
+            issuer_keys: vec![key_id.clone()],
+            sealer_keys: vec![key_id.clone()],
+            checkpoint_keys: Vec::new(),
+            stream_prefix: "urn:r5e:stream:test:endpoint:1:".to_string(),
+            actor_prefixes: vec!["urn:r5e:".to_string()],
+            required_payloads: "submitted".to_string(),
+            failure_domain: "managed-endpoint-local".to_string(),
+            on_failure: "refuse".to_string(),
+            deployment_policy_ref: Some(policy_ref.clone()),
+            policy_required_kinds: Vec::new(),
+            retention: None,
+        };
+        let mut recorder = EndpointBundleRecorder::new();
+        let prof_ref = recorder.put_blob(b"{}", Some("application/json"));
+
+        let mut state = EnrolledStateFile {
+            format: "r5e.endpoint-enrolled-state/v1".to_string(),
+            gateway_url: "http://127.0.0.1:4000".to_string(),
+            workload_seed_b64: BASE64_STANDARD.encode(seed),
+            subject_key_id: key_id,
+            holder: "antigravity-hook".to_string(),
+            workload: Some("urn:r5e:workload:antigravity-hook".to_string()),
+            purpose: None,
+            badge_ref:
+                "evidence:sha256:2222222222222222222222222222222222222222222222222222222222222222"
+                    .to_string(),
+            stream_prefix: "urn:r5e:stream:test:endpoint:1:".to_string(),
+            acts_for: Some("urn:r5e:principal:test:user".to_string()),
+            actor_prefixes: vec!["urn:r5e:".to_string()],
+            granted_kinds: DEFAULT_HOOK_WORKLOAD_KINDS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect(),
+            not_before: "2026-01-01T00:00:00Z".to_string(),
+            not_after: "2027-01-01T00:00:00Z".to_string(),
+            local_profile_ref: prof_ref,
+            deployment_policy_ref: policy_ref,
+            retention: None,
+            capture_profile: profile,
+            session_urn: Some("urn:r5e:session:test:s1".to_string()),
+            session_anchor_ref: None,
+            recorder,
+            shipped_record_refs: Vec::new(),
+        };
+
+        let ev = normalize_hook_payload(
+            HookClient::Antigravity,
+            HookMode::Observe,
+            &json!({
+                "hookEventName": "PostToolUse",
+                "conversationId": "conv-err",
+                "stepIdx": 3,
+                "error": "sensitive stderr output from /Users/alice/private.txt",
+                "toolCall": {"id": "tc-err", "name": "run_command", "args": {"CommandLine": "cat x"}}
+            }),
+        );
+        append_queued_event_to_state(&mut state, &ev).expect("append PostToolUse");
+
+        let tr_rec = state.recorder.records().last().expect("ToolResult record");
+        let payload_bytes = decode_strict_base64(&tr_rec.envelope.payload).unwrap();
+        let payload_val: Value = serde_json::from_slice(&payload_bytes).unwrap();
+        assert_eq!(payload_val["kind"], "ToolResult");
+        assert_eq!(payload_val["body"]["outcome"], "failed");
+        assert_eq!(payload_val["body"]["reason"], "tool_error");
+        let body_str = serde_json::to_string(&payload_val["body"]).unwrap();
+        assert!(
+            !body_str.contains("sensitive stderr"),
+            "raw error text must never appear in permanent ToolResult.body: {body_str}"
+        );
+    }
+
+    #[test]
+    fn uninstall_hooks_removes_only_r5e_entries_and_preserves_user_hooks() {
+        let dir = temp_dir("uninstall");
+        let agy_dir = dir.join("agy");
+        fs::create_dir_all(&agy_dir).unwrap();
+        fs::write(
+            agy_dir.join("hooks.json"),
+            r#"{"user-linter":{"enabled":true,"PostToolUse":[]}}"#,
+        )
+        .unwrap();
+        install_hooks_config(&InstallHooksOptions {
+            client: HookClient::Antigravity,
+            mode: HookMode::Observe,
+            gateway_url: "https://dev.r5e.io".to_string(),
+            target_dir: agy_dir.clone(),
+            helper_bin: PathBuf::from("/usr/local/bin/r5e-endpoint-helper"),
+            state_dir: None,
+            cedar_policy: None,
+            bearer_token_file: None,
+        })
+        .unwrap();
+
+        let (cfg_path, removed) =
+            uninstall_hooks_config(HookClient::Antigravity, &agy_dir).unwrap();
+        assert!(removed);
+        let after: Value = serde_json::from_str(&fs::read_to_string(&cfg_path).unwrap()).unwrap();
+        assert!(after.get("user-linter").is_some());
+        assert!(after.get("r5e-observe").is_none());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corrupt_jsonl_lines_are_skipped_without_wedging_drain() {
+        let dir = temp_dir("corrupt-jsonl");
+        let sess_dir = dir.join("sessions/conv-corrupt");
+        fs::create_dir_all(&sess_dir).unwrap();
+        fs::write(
+            sess_dir.join("events.jsonl"),
+            "{this is corrupt json\nnot json either\n",
+        )
+        .unwrap();
+
+        let opts = HookRunOptions {
+            client: HookClient::Antigravity,
+            mode: HookMode::Observe,
+            gateway_url: "http://127.0.0.1:4000".to_string(),
+            state_dir: dir.clone(),
+            bearer_token_env: "R5E_TEST_CORRUPT_DRAIN_TOK".to_string(),
+            bearer_token_file: None,
+            cedar_policy: None,
+            spawn_drainer: false,
+        };
+        std::env::set_var("R5E_TEST_CORRUPT_DRAIN_TOK", "dummy-token-for-corrupt-test");
+        let res = drain_conversation("conv-corrupt", &opts);
+        assert!(res.is_ok(), "corrupt JSONL should not fail drain: {res:?}");
+        let cursor = fs::read_to_string(sess_dir.join("cursor.txt")).unwrap();
+        assert_eq!(cursor.trim(), "2");
+
+        let _ = fs::remove_dir_all(&dir);
     }
 }

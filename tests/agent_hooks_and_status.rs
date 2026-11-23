@@ -189,6 +189,29 @@ forbid (
         assert!(serde_json::to_string(&doc)
             .unwrap()
             .contains("r5e-endpoint-helper"));
+
+        // uninstall-hooks removes the r5e-endpoint-helper entry cleanly
+        let uninstall = Command::new(bin)
+            .args([
+                "uninstall-hooks",
+                client,
+                "--path",
+                cfg_dir.to_str().unwrap(),
+            ])
+            .output()
+            .expect("run uninstall-hooks");
+        assert!(
+            uninstall.status.success(),
+            "uninstall-hooks {client} failed: {}",
+            String::from_utf8_lossy(&uninstall.stderr)
+        );
+        let un_json: Value = serde_json::from_slice(&uninstall.stdout).unwrap();
+        assert_eq!(un_json["removed"], true);
+        let after_doc: Value =
+            serde_json::from_str(&fs::read_to_string(&written).unwrap()).unwrap();
+        assert!(!serde_json::to_string(&after_doc)
+            .unwrap()
+            .contains("r5e-endpoint-helper"));
     }
 
     let _ = fs::remove_dir_all(&tmp);

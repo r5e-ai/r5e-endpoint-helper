@@ -241,6 +241,27 @@ impl LocalCedarGate {
         let authorizer = Authorizer::new();
         let response = authorizer.is_authorized(&request, &self.policies, &entities);
 
+        let eval_errors: Vec<String> = response
+            .diagnostics()
+            .errors()
+            .map(ToString::to_string)
+            .collect();
+        if !eval_errors.is_empty() && self.posture == Posture::Enforce {
+            return Ok(GateVerdict {
+                allowed_to_execute: false,
+                cedar_decision: "deny".to_string(),
+                outcome: EnforcementOutcome::Prevented,
+                policy_bundle_ref: self.policy_bundle_ref.clone(),
+                matching_policy_ids: vec!["cedar_eval_error".to_string()],
+                offline_mode: self.offline_mode,
+                agent_message: Some(format!(
+                    "Blocked on endpoint by organisation policy ({}) — cedar_eval_error: {}",
+                    self.policy_bundle_ref,
+                    eval_errors.join("; ")
+                )),
+            });
+        }
+
         let mut matching_ids: Vec<String> = response
             .diagnostics()
             .reason()
@@ -470,5 +491,53 @@ forbid (
             msg.contains("forbid rule(s): deny-dangerous#policy0, deny-dangerous#policy1"),
             "unexpected deny message: {msg}"
         );
+    }
+
+    #[test]
+    fn cedar_evaluation_error_in_forbid_rule_fails_closed_as_deny_in_enforce_mode() {
+        let cedar = r#"
+@id("permit-echo")
+permit (
+    principal,
+    action == Recurse::Action::"ExecCommand",
+    resource
+) when {
+    context.program == "echo"
+};
+
+@id("forbid-with-eval-error")
+forbid (
+    principal,
+    action == Recurse::Action::"ExecCommand",
+    resource
+) when {
+    context.nonexistent_attr == "secret"
+};
+"#;
+        let gate = LocalCedarGate::from_cedar_src(cedar, Posture::Enforce, false)
+            .expect("valid cedar syntax");
+        let verdict = gate
+            .evaluate(
+                "agent-1",
+                "urn:r5e:session:test:1",
+                &LocalActionKind::ExecCommand {
+                    program: "echo".to_string(),
+                    argv: vec!["hi".to_string()],
+                    command_line: "echo hi".to_string(),
+                },
+            )
+            .expect("evaluate");
+        assert!(
+            !verdict.allowed_to_execute,
+            "errored forbid rule must fail closed as deny in enforce mode"
+        );
+        assert_eq!(verdict.cedar_decision, "deny");
+        assert_eq!(verdict.outcome, EnforcementOutcome::Prevented);
+        assert_eq!(verdict.matching_policy_ids, vec!["cedar_eval_error"]);
+        assert!(verdict
+            .agent_message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("cedar_eval_error"));
     }
 }

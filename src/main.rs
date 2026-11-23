@@ -1153,6 +1153,16 @@ enum Commands {
         #[arg(long = "bearer-token-file", visible_alias = "token-file")]
         bearer_token_file: Option<PathBuf>,
     },
+    /// Remove native `r5e-endpoint-helper hook` entries for `antigravity`, `claude-code`,
+    /// or `codex` without disturbing other user hooks.
+    UninstallHooks {
+        /// Agent client to remove hooks from (`antigravity`, `claude-code`, or `codex`).
+        #[arg(value_enum)]
+        client: CliHookClient,
+        /// Target configuration directory (e.g. `.agents` for Antigravity, `~/.claude` for Claude Code).
+        #[arg(long)]
+        path: PathBuf,
+    },
     /// Print a machine-readable endpoint hook/enrollment status snapshot for desktop/tray IPC.
     Status {
         /// Hook state directory to inspect (defaults to `R5E_HOOK_STATE_DIR` or `~/.config/r5e/hooks`).
@@ -5104,6 +5114,27 @@ permit(
                 }
                 Err(err) => {
                     eprintln!("r5e-endpoint-helper: install-hooks failed: {err}");
+                    exit(1);
+                }
+            }
+        }
+        Commands::UninstallHooks { client, path } => {
+            use r5e_endpoint_helper::agent_hooks::{uninstall_hooks_config, HookClient};
+            let client = HookClient::from(client);
+            match uninstall_hooks_config(client, &path) {
+                Ok((config_path, removed)) => {
+                    let summary = json!({
+                        "ok": true,
+                        "client": client.as_str(),
+                        "config_path": config_path.to_string_lossy(),
+                        "removed": removed,
+                    });
+                    let out_bytes = encode_canonical_json(&summary)
+                        .expect("canonical uninstall-hooks response JSON");
+                    println!("{}", String::from_utf8_lossy(&out_bytes));
+                }
+                Err(err) => {
+                    eprintln!("r5e-endpoint-helper: uninstall-hooks failed: {err}");
                     exit(1);
                 }
             }
