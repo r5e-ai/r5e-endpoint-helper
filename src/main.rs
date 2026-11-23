@@ -5096,6 +5096,7 @@ permit(
                         "mode": opts.mode.as_str(),
                         "gateway_url": opts.gateway_url,
                         "config_path": config_path.to_string_lossy(),
+                        "notice": "Secret redaction is best-effort; tool arguments and outputs are shipped as erasable content blobs to the configured gateway.",
                     });
                     let out_bytes = encode_canonical_json(&summary)
                         .expect("canonical install-hooks response JSON");

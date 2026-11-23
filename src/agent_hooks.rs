@@ -184,18 +184,24 @@ pub fn sanitize_conversation_id(raw: Option<&str>) -> String {
     let Some(s) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
         return "unknown-conversation".to_string();
     };
+    // If a client passes anything resembling a filesystem path or traversal, hash it
+    // to an opaque identifier so no path or name can leak into permanent SessionOpened.details.
+    if s.contains('/') || s.contains('\\') || s.contains("..") {
+        let digest = hex_lower(&Sha256::digest(s.as_bytes()));
+        return format!("conv-{}", &digest[..24]);
+    }
     let cleaned: String = s
         .chars()
         .map(|c| {
-            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+            if c.is_ascii_alphanumeric() || matches!(c, '_' | '-') {
                 c
             } else {
                 '_'
             }
         })
-        .take(96)
+        .take(64)
         .collect();
-    if cleaned.is_empty() {
+    if cleaned.is_empty() || cleaned.chars().all(|c| c == '_') {
         "unknown-conversation".to_string()
     } else {
         cleaned
@@ -627,10 +633,21 @@ fn default_stdout_for_event(client: HookClient, kind: NormalizedEventKind) -> Va
     }
 }
 
+fn enforce_block_response(client: HookClient, reason: &str) -> Value {
+    match client {
+        HookClient::Antigravity => json!({"decision": "deny", "reason": reason}),
+        HookClient::ClaudeCode | HookClient::Codex => {
+            json!({"decision": "block", "reason": reason})
+        }
+    }
+}
+
 /// Runs the fast synchronous stdin -> stdout hook path.
 ///
-/// Always returns valid JSON for the client; in `observe` mode, errors are logged
-/// and swallowed so the hook remains strictly fail-open.
+/// In `observe` mode, errors are logged and swallowed so the hook remains strictly
+/// fail-open (`exit 0` + valid client JSON). In `enforce` mode, `PreToolUse` ALWAYS
+/// fails **closed** (missing `--cedar-policy`, unreadable/invalid Cedar, or evaluation
+/// error all return `deny`/`block`).
 pub fn run_hook_invocation(stdin_raw: &str, opts: &HookRunOptions) -> Value {
     let payload: Value = if stdin_raw.trim().is_empty() {
         json!({})
@@ -639,6 +656,12 @@ pub fn run_hook_invocation(stdin_raw: &str, opts: &HookRunOptions) -> Value {
             Ok(v) => v,
             Err(err) => {
                 append_hook_log(&opts.state_dir, &format!("hook invalid stdin JSON: {err}"));
+                if opts.mode == HookMode::Enforce {
+                    return enforce_block_response(
+                        opts.client,
+                        "Policy unavailable: malformed hook payload in enforce mode",
+                    );
+                }
                 json!({})
             }
         }
@@ -648,47 +671,62 @@ pub fn run_hook_invocation(stdin_raw: &str, opts: &HookRunOptions) -> Value {
     let mut response = default_stdout_for_event(opts.client, ev.event_kind);
 
     if opts.mode == HookMode::Enforce && ev.event_kind == NormalizedEventKind::PreToolUse {
-        if let Some(ref policy_path) = opts.cedar_policy {
-            match fs::read_to_string(policy_path)
-                .map_err(|e| format!("read cedar policy {}: {e}", policy_path.display()))
-                .and_then(|src| LocalCedarGate::from_cedar_src(&src, Posture::Enforce, false))
-            {
-                Ok(gate) => {
-                    let action = build_cedar_action_for_hook(&ev);
-                    match gate.evaluate(
-                        opts.client.as_str(),
-                        &format!("urn:r5e:session:hook:{}", ev.conversation_id),
-                        &action,
-                    ) {
-                        Ok(verdict) => {
-                            ev.enforce_outcome = Some(verdict.cedar_decision.clone());
-                            ev.enforce_policy_ref = Some(verdict.policy_bundle_ref.clone());
-                            ev.enforce_matching_ids = verdict.matching_policy_ids.clone();
-                            ev.enforce_reason = verdict.agent_message.clone();
-                            if !verdict.allowed_to_execute {
-                                let reason = verdict.agent_message.unwrap_or_else(|| {
-                                    "Blocked by organisation Cedar policy".to_string()
-                                });
-                                response = match opts.client {
-                                    HookClient::Antigravity => {
-                                        json!({"decision": "deny", "reason": reason})
-                                    }
-                                    HookClient::ClaudeCode | HookClient::Codex => {
-                                        json!({"decision": "block", "reason": reason})
-                                    }
-                                };
-                            } else if opts.client == HookClient::Antigravity {
-                                response = json!({"decision": "allow"});
-                            }
-                        }
-                        Err(err) => {
-                            append_hook_log(&opts.state_dir, &format!("enforce eval error: {err}"));
+        let Some(ref policy_path) = opts.cedar_policy else {
+            let reason = "Policy unavailable (no_bundle): enforce mode requires --cedar-policy";
+            append_hook_log(&opts.state_dir, reason);
+            ev.enforce_outcome = Some("deny".to_string());
+            ev.enforce_reason = Some(reason.to_string());
+            response = enforce_block_response(opts.client, reason);
+            // Queue the denied PolicyDecision before returning.
+            let sess_dir = opts.state_dir.join("sessions").join(&ev.conversation_id);
+            if ensure_dir_0700(&sess_dir).is_ok() {
+                if let Ok(line) = serde_json::to_string(&ev) {
+                    let _ = append_line_0600(&sess_dir.join("events.jsonl"), &line);
+                }
+            }
+            return response;
+        };
+
+        match fs::read_to_string(policy_path)
+            .map_err(|e| format!("read cedar policy {}: {e}", policy_path.display()))
+            .and_then(|src| LocalCedarGate::from_cedar_src(&src, Posture::Enforce, false))
+        {
+            Ok(gate) => {
+                let action = build_cedar_action_for_hook(&ev);
+                match gate.evaluate(
+                    opts.client.as_str(),
+                    &format!("urn:r5e:session:hook:{}", ev.conversation_id),
+                    &action,
+                ) {
+                    Ok(verdict) => {
+                        ev.enforce_outcome = Some(verdict.cedar_decision.clone());
+                        ev.enforce_policy_ref = Some(verdict.policy_bundle_ref.clone());
+                        ev.enforce_matching_ids = verdict.matching_policy_ids.clone();
+                        ev.enforce_reason = verdict.agent_message.clone();
+                        if !verdict.allowed_to_execute {
+                            let reason = verdict.agent_message.unwrap_or_else(|| {
+                                "Blocked by organisation Cedar policy".to_string()
+                            });
+                            response = enforce_block_response(opts.client, &reason);
+                        } else if opts.client == HookClient::Antigravity {
+                            response = json!({"decision": "allow"});
                         }
                     }
+                    Err(err) => {
+                        let reason = format!("Policy evaluation error (cedar_eval_error): {err}");
+                        append_hook_log(&opts.state_dir, &reason);
+                        ev.enforce_outcome = Some("deny".to_string());
+                        ev.enforce_reason = Some(reason.clone());
+                        response = enforce_block_response(opts.client, &reason);
+                    }
                 }
-                Err(err) => {
-                    append_hook_log(&opts.state_dir, &format!("enforce load error: {err}"));
-                }
+            }
+            Err(err) => {
+                let reason = format!("Policy unavailable (no_bundle): {err}");
+                append_hook_log(&opts.state_dir, &reason);
+                ev.enforce_outcome = Some("deny".to_string());
+                ev.enforce_reason = Some(reason.clone());
+                response = enforce_block_response(opts.client, &reason);
             }
         }
     }
@@ -866,16 +904,28 @@ fn ensure_enrolled_and_opened(
     Ok(state)
 }
 
-fn effective_captured_at(raw_captured_at: &str, badge_not_before: &str) -> String {
+/// Resolves the `capturedAt` timestamp for a queued event against `badge.notBefore`.
+///
+/// Because the first event of a conversation may be enqueued milliseconds before lazy
+/// background badge enrolment completes, gateway `profile_bounds` requires
+/// `capturedAt >= badge.notBefore`. When clamping is necessary, this returns
+/// `(clamped_captured_at, Some(original_observed_at))` so callers record the true
+/// observation timestamp in `body.details.observedAt` rather than silently rewriting
+/// history.
+pub fn resolve_captured_at(
+    raw_captured_at: &str,
+    badge_not_before: &str,
+) -> (String, Option<String>) {
     if raw_captured_at >= badge_not_before {
-        return raw_captured_at.to_string();
+        return (raw_captured_at.to_string(), None);
     }
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
-    if now.as_str() >= badge_not_before {
+    let clamped = if now.as_str() >= badge_not_before {
         now
     } else {
         badge_not_before.to_string()
-    }
+    };
+    (clamped, Some(raw_captured_at.to_string()))
 }
 
 fn append_queued_event_to_state(
@@ -885,7 +935,8 @@ fn append_queued_event_to_state(
     let actor = ev.client.actor_uri();
     let session_urn = state.session_urn.clone();
     let session_ref = session_urn.as_deref();
-    let captured_at = effective_captured_at(&ev.captured_at, &state.not_before);
+    let (captured_at, clamped_observed_at) =
+        resolve_captured_at(&ev.captured_at, &state.not_before);
 
     match ev.event_kind {
         NormalizedEventKind::SessionStart | NormalizedEventKind::Unknown => Ok(false),
@@ -921,17 +972,36 @@ fn append_queued_event_to_state(
                     eval.insert("reason".to_string(), Value::String(reason.clone()));
                 }
             }
+            let mut pd_details = Map::new();
+            pd_details.insert("posture".to_string(), json!("enforce"));
+            pd_details.insert(
+                "enforcementOutcome".to_string(),
+                json!(if outcome == "allow" {
+                    "allowed"
+                } else {
+                    "prevented"
+                }),
+            );
+            pd_details.insert(
+                "matchingPolicyIds".to_string(),
+                json!(ev.enforce_matching_ids.join(",")),
+            );
+            pd_details.insert(
+                "matchingPolicyCount".to_string(),
+                json!(ev.enforce_matching_ids.len() as i64),
+            );
+            pd_details.insert("action".to_string(), json!("PreToolUse"));
+            pd_details.insert(
+                "target".to_string(),
+                json!(truncate_utf8_bytes(target_basename, 256)),
+            );
+            if let Some(ref obs_at) = clamped_observed_at {
+                pd_details.insert("observedAt".to_string(), json!(obs_at));
+            }
             let body = json!({
                 "subject": args_ref,
                 "evaluation": Value::Object(eval),
-                "details": {
-                    "posture": "enforce",
-                    "enforcementOutcome": if outcome == "allow" { "allowed" } else { "prevented" },
-                    "matchingPolicyIds": ev.enforce_matching_ids.join(","),
-                    "matchingPolicyCount": ev.enforce_matching_ids.len() as i64,
-                    "action": "PreToolUse",
-                    "target": truncate_utf8_bytes(target_basename, 256),
-                }
+                "details": Value::Object(pd_details),
             });
             state.append_workload_record(
                 "events",
@@ -973,6 +1043,9 @@ fn append_queued_event_to_state(
             );
             if let Some(step) = ev.step_idx {
                 tc_details.insert("stepIdx".to_string(), json!(step));
+            }
+            if let Some(ref obs_at) = clamped_observed_at {
+                tc_details.insert("observedAt".to_string(), json!(obs_at));
             }
             let tc_body = json!({
                 "tool": truncate_utf8_bytes(tool, 128),
@@ -1072,14 +1145,23 @@ fn append_queued_event_to_state(
             let obs_ref = state
                 .recorder
                 .put_blob(obs_text.as_bytes(), Some("application/json"));
+            let mut obs_details = Map::new();
+            obs_details.insert("kind".to_string(), json!("turn.completed"));
+            obs_details.insert(
+                "modelName".to_string(),
+                json!(truncate_utf8_bytes(model, 128)),
+            );
+            obs_details.insert(
+                "terminationReason".to_string(),
+                json!(truncate_utf8_bytes(term, 128)),
+            );
+            if let Some(ref obs_at) = clamped_observed_at {
+                obs_details.insert("observedAt".to_string(), json!(obs_at));
+            }
             let obs_body = json!({
                 "topic": "turn.completed",
                 "contentRefs": [obs_ref],
-                "details": {
-                    "kind": "turn.completed",
-                    "modelName": truncate_utf8_bytes(model, 128),
-                    "terminationReason": truncate_utf8_bytes(term, 128),
-                }
+                "details": Value::Object(obs_details),
             });
             state.append_workload_record(
                 "events",
@@ -1272,6 +1354,12 @@ fn merge_event_hook_list(existing: Option<&Value>, entry: Value) -> Value {
 /// Installs or updates the `r5e-endpoint-helper` hook entry for the target agent client
 /// without clobbering existing user hooks.
 pub fn install_hooks_config(opts: &InstallHooksOptions) -> Result<PathBuf, String> {
+    if opts.mode == HookMode::Enforce && opts.cedar_policy.is_none() {
+        return Err(
+            "install-hooks --mode enforce requires --cedar-policy <FILE> (enforce fails closed without a policy)"
+                .to_string(),
+        );
+    }
     fs::create_dir_all(&opts.target_dir)
         .map_err(|e| format!("create {}: {e}", opts.target_dir.display()))?;
     let cmd = build_hook_command_string(opts);
@@ -1628,5 +1716,106 @@ forbid (
         assert!(cc_json["hooks"]["PreToolUse"].as_array().unwrap().len() == 1);
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enforce_mode_fails_closed_on_missing_policy_unreadable_file_invalid_cedar_and_malformed_stdin(
+    ) {
+        let dir = temp_dir("enforce-fail-closed");
+        let pre_tool_payload = r#"{"hookEventName":"PreToolUse","conversationId":"conv-fc","toolCall":{"id":"c1","name":"run_command","args":{"CommandLine":"echo hi"}}}"#;
+
+        // 1. Missing --cedar-policy -> deny (Antigravity) & block (Claude Code)
+        let no_policy_opts = HookRunOptions {
+            client: HookClient::Antigravity,
+            mode: HookMode::Enforce,
+            gateway_url: "http://127.0.0.1:4000".to_string(),
+            state_dir: dir.clone(),
+            bearer_token_env: "R5E_TOKEN".to_string(),
+            bearer_token_file: None,
+            cedar_policy: None,
+            spawn_drainer: false,
+        };
+        let out_no_policy = run_hook_invocation(pre_tool_payload, &no_policy_opts);
+        assert_eq!(out_no_policy["decision"], "deny");
+        assert!(out_no_policy["reason"]
+            .as_str()
+            .unwrap()
+            .contains("no_bundle"));
+
+        // 2. Non-existent policy file -> deny
+        let missing_file_opts = HookRunOptions {
+            cedar_policy: Some(dir.join("does-not-exist.cedar")),
+            ..no_policy_opts.clone()
+        };
+        let out_missing = run_hook_invocation(pre_tool_payload, &missing_file_opts);
+        assert_eq!(out_missing["decision"], "deny");
+        assert!(out_missing["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Policy unavailable"));
+
+        // 3. Invalid Cedar syntax -> block (Claude Code)
+        let bad_cedar = dir.join("broken.cedar");
+        fs::write(&bad_cedar, "this is not valid cedar {{{{").unwrap();
+        let bad_cedar_opts = HookRunOptions {
+            client: HookClient::ClaudeCode,
+            cedar_policy: Some(bad_cedar),
+            ..no_policy_opts.clone()
+        };
+        let out_bad = run_hook_invocation(
+            r#"{"hook_event_name":"PreToolUse","session_id":"conv-fc2","tool_name":"Bash","tool_input":{"command":"ls"}}"#,
+            &bad_cedar_opts,
+        );
+        assert_eq!(out_bad["decision"], "block");
+        assert!(out_bad["reason"]
+            .as_str()
+            .unwrap()
+            .contains("Policy unavailable"));
+
+        // 4. Malformed stdin JSON in enforce mode -> deny
+        let out_malformed = run_hook_invocation("{broken", &no_policy_opts);
+        assert_eq!(out_malformed["decision"], "deny");
+
+        // 5. install-hooks --mode enforce without --cedar-policy -> refused
+        let install_err = install_hooks_config(&InstallHooksOptions {
+            client: HookClient::Antigravity,
+            mode: HookMode::Enforce,
+            gateway_url: "https://dev.r5e.io".to_string(),
+            target_dir: dir.join("install"),
+            helper_bin: PathBuf::from("/usr/local/bin/r5e-endpoint-helper"),
+            state_dir: None,
+            cedar_policy: None,
+            bearer_token_file: None,
+        })
+        .unwrap_err();
+        assert!(install_err.contains("--cedar-policy"));
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resolve_captured_at_preserves_original_observed_at_when_clamped() {
+        let (ts_unclamped, obs_unclamped) =
+            resolve_captured_at("2026-11-23T06:00:05.000000Z", "2026-11-23T06:00:00Z");
+        assert_eq!(ts_unclamped, "2026-11-23T06:00:05.000000Z");
+        assert_eq!(obs_unclamped, None);
+
+        let (ts_clamped, obs_clamped) =
+            resolve_captured_at("2026-11-23T05:59:58.123456Z", "2099-01-01T00:00:00Z");
+        assert_eq!(ts_clamped, "2099-01-01T00:00:00Z");
+        assert_eq!(obs_clamped.as_deref(), Some("2026-11-23T05:59:58.123456Z"));
+    }
+
+    #[test]
+    fn sanitize_conversation_id_hashes_path_like_inputs() {
+        let hashed = sanitize_conversation_id(Some("/Users/alice/secret/project/../conv"));
+        assert!(hashed.starts_with("conv-"));
+        assert!(!hashed.contains("alice"));
+        assert!(!hashed.contains('/'));
+        assert!(!hashed.contains(".."));
+        assert_eq!(
+            sanitize_conversation_id(Some("conv_123-abc")),
+            "conv_123-abc"
+        );
     }
 }
