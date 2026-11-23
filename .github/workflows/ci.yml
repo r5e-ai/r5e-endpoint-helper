@@ -21,6 +21,12 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Checkout r5e-spec definitions
+        uses: actions/checkout@v4
+        with:
+          repository: r5e-ai/r5e-spec
+          path: _ci/r5e-spec
+
       - name: Ensure stable Rust toolchain with rustfmt and clippy
         run: |
           rustup update stable --no-self-update
@@ -47,4 +53,6 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Run unit and integration tests
+        env:
+          R5E_DEFINITIONS_DIR: ${{ github.workspace }}/_ci/r5e-spec/definitions
         run: cargo test --locked
