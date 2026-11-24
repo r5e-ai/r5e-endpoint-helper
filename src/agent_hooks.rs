@@ -16,7 +16,7 @@ use crate::enrolment_http::{
     enrol_endpoint_badge_with_options, EnrolBadgeOptions, EnrolmentClientConfig,
 };
 use crate::evidence_http::{
-    build_ship_request_from_recorder, open_session_over_http, ship_records_batches_over_http,
+    build_ship_request_from_recorder, open_session_over_http, ship_records_batches_with_callback,
     EnrolledStateFile, OpenSessionRequest,
 };
 use crate::policy_gate::{hex_lower, LocalActionKind, LocalCedarGate, Posture};
@@ -1601,21 +1601,24 @@ pub fn drain_conversation(conv_id: &str, opts: &HookRunOptions) -> Result<(), St
                 continue;
             }
 
-            let responses =
-                ship_records_batches_over_http(&opts.gateway_url, &bearer_token, &ship_req)
-                    .map_err(|e| format!("ship-bundle failed: {e}"))?;
             let mut total_admitted = 0usize;
             let mut total_missing = 0usize;
-            for resp in &responses {
-                for item in &resp.admitted {
-                    total_admitted += 1;
-                    total_missing += item.content_missing.len();
-                    if !state.shipped_record_refs.contains(&item.record_ref) {
-                        state.shipped_record_refs.push(item.record_ref.clone());
+            ship_records_batches_with_callback(
+                &opts.gateway_url,
+                &bearer_token,
+                &ship_req,
+                |resp| {
+                    for item in &resp.admitted {
+                        total_admitted += 1;
+                        total_missing += item.content_missing.len();
+                        if !state.shipped_record_refs.contains(&item.record_ref) {
+                            state.shipped_record_refs.push(item.record_ref.clone());
+                        }
                     }
-                }
-            }
-            state.save_0600(&state_path, true)?;
+                    state.save_0600(&state_path, true)
+                },
+            )
+            .map_err(|e| format!("ship-bundle failed: {e}"))?;
 
             let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
             meta.last_ship_at = Some(now);
@@ -2531,6 +2534,161 @@ forbid (
         assert!(res.is_ok(), "corrupt JSONL should not fail drain: {res:?}");
         let cursor = fs::read_to_string(sess_dir.join("cursor.txt")).unwrap();
         assert_eq!(cursor.trim(), "2");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn incremental_batch_persist_keeps_batch_1_when_batch_2_fails() {
+        use crate::attestation::{DsseEnvelope, SignedEndpointRecord};
+        use crate::evidence_http::ShipRecordsRequest;
+        use std::io::{BufRead, BufReader, Read, Write};
+        use std::net::TcpListener;
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+
+        let dir = temp_dir("inc-batch-persist");
+        let persisted_path = dir.join("shipped_refs.json");
+
+        // Build 70 records so chunk_ship_records_request splits into 2 batches (64 + 6).
+        use base64::Engine as _;
+        let mut prev_ref: Option<String> = None;
+        let records: Vec<SignedEndpointRecord> = (0..70)
+            .map(|i| {
+                let payload_val = json!({
+                    "apiVersion": "provenance.r5e.io/v2",
+                    "kind": "Observation",
+                    "stream": "urn:r5e:stream:test:events",
+                    "seq": (i + 1) as u64,
+                    "previous": prev_ref,
+                    "capturedAt": "2026-11-23T00:00:00Z",
+                    "issuer": "key:ed25519:sha256:0000000000000000000000000000000000000000000000000000000000000001",
+                    "actor": "urn:r5e:agent:test",
+                    "profileRef": "bytes:sha256:0000000000000000000000000000000000000000000000000000000000000002",
+                    "schemaRef": "bytes:sha256:0000000000000000000000000000000000000000000000000000000000000003",
+                    "body": {"topic": "test"}
+                });
+                let payload_bytes = encode_canonical_json(&payload_val).unwrap();
+                let mut h = Sha256::new();
+                h.update(&payload_bytes);
+                let rec_ref = format!("evidence:sha256:{}", hex_lower(&h.finalize()));
+                prev_ref = Some(rec_ref.clone());
+                SignedEndpointRecord {
+                    record_ref: rec_ref,
+                    envelope: DsseEnvelope {
+                        payload_type: "application/vnd.r5e.provenance-evidence+json;v=2"
+                            .to_string(),
+                        payload: base64::engine::general_purpose::STANDARD.encode(&payload_bytes),
+                        signatures: Vec::new(),
+                    },
+                }
+            })
+            .collect();
+        let expected_first = records[0].record_ref.clone();
+        let expected_64th = records[63].record_ref.clone();
+        let req = ShipRecordsRequest {
+            records,
+            keys: Vec::new(),
+            blobs: Vec::new(),
+            authority: None,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let req_count = Arc::new(AtomicUsize::new(0));
+        let req_count_srv = Arc::clone(&req_count);
+
+        let srv = std::thread::spawn(move || {
+            for stream in listener.incoming().take(2) {
+                let mut stream = stream.unwrap();
+                let n = req_count_srv.fetch_add(1, Ordering::SeqCst);
+
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut content_len = 0usize;
+                loop {
+                    let mut line = String::new();
+                    if reader.read_line(&mut line).unwrap() == 0 || line == "\r\n" {
+                        break;
+                    }
+                    if let Some(rest) = line.to_ascii_lowercase().strip_prefix("content-length:") {
+                        content_len = rest.trim().parse().unwrap_or(0);
+                    }
+                }
+                let mut body_buf = vec![0u8; content_len];
+                reader.read_exact(&mut body_buf).unwrap();
+
+                if n == 0 {
+                    // Batch 1 (64 records): admit cleanly with HTTP 201.
+                    let parsed: Value = serde_json::from_slice(&body_buf).unwrap();
+                    let recs = parsed["records"].as_array().unwrap();
+                    assert_eq!(recs.len(), 64);
+                    let admitted: Vec<Value> = recs
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, r)| {
+                            json!({
+                                "ref": r["ref"],
+                                "stream": "urn:r5e:stream:test:events",
+                                "seq": (idx + 1) as u64,
+                                "status": "admitted",
+                                "contentMissing": []
+                            })
+                        })
+                        .collect();
+                    let resp_body =
+                        serde_json::to_string(&json!({ "admitted": admitted })).unwrap();
+                    let resp = format!(
+                        "HTTP/1.1 201 Created\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    stream.write_all(resp.as_bytes()).unwrap();
+                } else {
+                    // Batch 2 (6 records): drop connection without status line (simulates timeout/disconnect).
+                    drop(stream);
+                }
+            }
+        });
+
+        let mut persisted_refs: Vec<String> = Vec::new();
+        let err = ship_records_batches_with_callback(
+            &format!("http://{addr}"),
+            "test-bearer-token",
+            &req,
+            |batch| {
+                for item in &batch.admitted {
+                    if !persisted_refs.contains(&item.record_ref) {
+                        persisted_refs.push(item.record_ref.clone());
+                    }
+                }
+                fs::write(
+                    &persisted_path,
+                    serde_json::to_string(&persisted_refs).unwrap(),
+                )
+                .map_err(|e| e.to_string())
+            },
+        )
+        .expect_err("batch 2 disconnect must surface an error");
+
+        assert_eq!(
+            req_count.load(Ordering::SeqCst),
+            2,
+            "expected 2 HTTP batch requests before failing; err={err}"
+        );
+        srv.join().unwrap();
+        assert!(
+            format!("{err}").contains("transport") || format!("{err}").contains("503"),
+            "expected transport/503 error on batch 2 disconnect, got: {err}"
+        );
+
+        // Batch 1's 64 admitted refs MUST already be persisted on disk despite batch 2 failing!
+        let on_disk: Vec<String> =
+            serde_json::from_str(&fs::read_to_string(&persisted_path).unwrap()).unwrap();
+        assert_eq!(on_disk.len(), 64);
+        assert_eq!(on_disk[0], expected_first);
+        assert_eq!(on_disk[63], expected_64th);
 
         let _ = fs::remove_dir_all(&dir);
     }
