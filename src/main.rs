@@ -34,8 +34,9 @@ use r5e_endpoint_helper::enrolment_http::{
 use r5e_endpoint_helper::evidence_http::{
     build_ship_request_from_recorder, flush_outbox_over_http_with_key,
     load_ship_request_from_bundle_path, normalize_workload_kind, open_session_over_http,
-    persist_outbox_and_ship_state_with_key, revoke_badge_over_http, ship_records_over_http,
-    EnrolledStateFile, OpenSessionRequest, OutboxQueueFile,
+    persist_outbox_and_ship_state_with_key, revoke_badge_over_http,
+    ship_records_batches_with_callback, ship_records_over_http, EnrolledStateFile,
+    OpenSessionRequest, OutboxQueueFile,
 };
 use r5e_endpoint_helper::hold_release::{
     build_releaser_grant, execute_release_hold_ceremony, HoldReleaseClientConfig,
@@ -4521,25 +4522,29 @@ permit(
                         exit(1);
                     }
                 };
-                let resp = match ship_records_over_http(&gw_url, &bearer_token, &ship_req) {
-                    Ok(r) => r,
-                    Err(err) => {
-                        eprintln!("r5e-endpoint-helper: ship-bundle failed: {err}");
-                        exit(1);
-                    }
-                };
-                for item in &resp.admitted {
-                    if !st.shipped_record_refs.iter().any(|r| r == &item.record_ref) {
-                        st.shipped_record_refs.push(item.record_ref.clone());
-                    }
-                }
-                if let Err(err) = st.save_0600(sp, true) {
-                    eprintln!(
-                        "r5e-endpoint-helper: cannot update --state {}: {err}",
-                        sp.display()
-                    );
+                let mut combined_admitted = Vec::new();
+                let mut any_201 = false;
+                if let Err(err) =
+                    ship_records_batches_with_callback(&gw_url, &bearer_token, &ship_req, |batch| {
+                        if batch.http_status == Some(201) {
+                            any_201 = true;
+                        }
+                        for item in &batch.admitted {
+                            if !st.shipped_record_refs.iter().any(|r| r == &item.record_ref) {
+                                st.shipped_record_refs.push(item.record_ref.clone());
+                            }
+                        }
+                        combined_admitted.extend(batch.admitted.clone());
+                        st.save_0600(sp, true)
+                    })
+                {
+                    eprintln!("r5e-endpoint-helper: ship-bundle failed: {err}");
                     exit(1);
                 }
+                let resp = r5e_endpoint_helper::evidence_http::ShipRecordsResponse {
+                    admitted: combined_admitted,
+                    http_status: if any_201 { Some(201) } else { Some(200) },
+                };
                 let out_val = serde_json::to_value(&resp).expect("serialize ShipRecordsResponse");
                 let out_bytes =
                     encode_canonical_json(&out_val).expect("canonical ship-bundle JSON");

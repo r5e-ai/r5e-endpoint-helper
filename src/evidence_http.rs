@@ -758,11 +758,18 @@ pub fn chunk_ship_records_request(
 /// Ships workload operational records via `POST /v1/evidence/records` (`A8` §2), automatically
 /// splitting into `<= 64`-record batches (`< 6 MiB` per HTTP request) and returning each batch's
 /// [`ShipRecordsResponse`].
-pub fn ship_records_batches_over_http(
+/// Ships workload operational records in `<= 64`-record batches, invoking `on_batch` after each
+/// admitted batch so callers can persist `shipped_record_refs` incrementally before sending the
+/// next batch (preventing progress loss if a later batch times out or fails).
+pub fn ship_records_batches_with_callback<F>(
     gateway_url: &str,
     bearer_token: &str,
     request: &ShipRecordsRequest,
-) -> Result<Vec<ShipRecordsResponse>, EvidenceHttpError> {
+    mut on_batch: F,
+) -> Result<Vec<ShipRecordsResponse>, EvidenceHttpError>
+where
+    F: FnMut(&ShipRecordsResponse) -> Result<(), String>,
+{
     let batches = chunk_ship_records_request(request)?;
     let cfg = EvidenceClientConfig::new(gateway_url, bearer_token);
     let mut responses = Vec::with_capacity(batches.len());
@@ -783,10 +790,19 @@ pub fn ship_records_batches_over_http(
                 ))
             })?;
         parsed_resp.http_status = Some(status);
+        on_batch(&parsed_resp).map_err(EvidenceHttpError::Validation)?;
         responses.push(parsed_resp);
     }
 
     Ok(responses)
+}
+
+pub fn ship_records_batches_over_http(
+    gateway_url: &str,
+    bearer_token: &str,
+    request: &ShipRecordsRequest,
+) -> Result<Vec<ShipRecordsResponse>, EvidenceHttpError> {
+    ship_records_batches_with_callback(gateway_url, bearer_token, request, |_| Ok(()))
 }
 
 /// Ships workload operational records via `POST /v1/evidence/records` (`A8` §2), automatically
